@@ -997,7 +997,7 @@ class TestSequentialChain:
 
 
 class TestAdapterDispatch:
-    """Test through _dispatch_pa_reminder_action and send failure recovery."""
+    """Test through real _dispatch_pa_reminder_action with mocked Feishu."""
     @pytest.fixture
     def s(self, tmp_path, monkeypatch):
         monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
@@ -1006,26 +1006,57 @@ class TestAdapterDispatch:
         monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
         return rch
 
-    def test_send_success_updates_message_id(self, s):
-        s.persist_interaction("iad","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",["extend"])
-        # Can't test real adapter, test the save/restore logic directly
-        # dispatch extend → state → choosing_extend
-        r = s.dispatch_action("iad","extend","t1")
-        assert r["status"] == "choose_extend"
-        assert "card" in r
+    def test_real_dispatch_send_success(self, s):
+        """Real adapter dispatch with mocked _send_card_to_chat → success updates message_id."""
+        import plugins.platforms.feishu.adapter as adp
+        adapter = object.__new__(adp.FeishuAdapter)
+        adapter._derive_card_uuid = lambda iid, ctx: "uuid-"+iid
 
-    def test_send_failure_restores_state(self, s):
-        """Verify that after send failure, state and message_id are restored."""
-        import reminder_card_handler as rch
-        s.persist_interaction("ifo","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om1","oc",["extend"])
-        # Simulate: dispatch goes to choosing_extend, card send fails
-        r = s.dispatch_action("ifo","extend","t1")
-        assert r["status"] == "choose_extend"
-        # Save pre-send state
-        prev_state = s.get_interaction("ifo")["state"]
-        prev_msg = s.get_interaction("ifo")["active_message_id"]
-        # Simulate send failure by restoring
-        s.update_interaction("ifo", {"state": prev_state, "active_message_id": prev_msg})
-        d2 = s.get_interaction("ifo")
-        assert d2["state"] == prev_state
-        assert d2["active_message_id"] == prev_msg
+        s.persist_interaction("iads","dk",1,"completion","task.completion","2099-01-01T00:00:00+00:00","pg","om","oc",["extend"])
+
+        class FakeResult:
+            success=True; message_id="new-msg-id"
+
+        async def fake_send(**kw): return FakeResult()
+
+        with patch.object(adapter, "_send_card_to_chat", new=fake_send):
+            async def run():
+                await adapter._dispatch_pa_reminder_action(iid="iads",action="extend",etok="t1",params={})
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(run())
+            loop.close()
+
+        d = s.get_interaction("iads")
+        assert d["active_message_id"] == "new-msg-id"
+
+    def test_real_dispatch_send_failure_restores(self, s):
+        """Real adapter dispatch with send failure → state restored for retry."""
+        import plugins.platforms.feishu.adapter as adp
+        adapter = object.__new__(adp.FeishuAdapter)
+        adapter._derive_card_uuid = lambda iid, ctx: "uuid-"+iid
+
+        s.persist_interaction("iadf","dk",1,"completion","task.completion","2099-01-01T00:00:00+00:00","pg","om","oc",["extend"])
+
+        async def fake_send_fail(**kw): return None  # send failed
+
+        with patch.object(adapter, "_send_card_to_chat", new=fake_send_fail):
+            async def run():
+                await adapter._dispatch_pa_reminder_action(iid="iadf",action="extend",etok="t2",params={})
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(run())
+            loop.close()
+
+        d = s.get_interaction("iadf")
+        # State restored: should be choosing_extend (from extend dispatch)
+        assert d["state"] == "choosing_extend"
+        # Old message_id preserved
+        assert d["active_message_id"] == "om"
+
+        # Verify card can be retried (state allows it)
+        from reminder_card_handler import validate_click
+        err = validate_click("iadf","ou_frank","oc_frank","om","extend_confirm","tok-retry")
+        assert err is None  # old card still valid

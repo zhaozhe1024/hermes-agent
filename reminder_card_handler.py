@@ -63,7 +63,7 @@ def build_custom_date_card(iid,title):
     today=datetime.now().date()
     btns=[_btn(f"{today+timedelta(days=d)}（{'今天' if d==0 else '明天' if d==1 else str(d)+'天后'}）",
                "reschedule_custom_pick_date","primary" if d==0 else "default",iid,
-               custom_date=f"{today+timedelta(days=d)}") for d in range(7)]
+               custom_date=f"{today+timedelta(days=d)}") for d in range(14)]
     btns.append(_btn("返回推荐时间","reschedule_cancel","danger",iid))
     return _card("选择日期",f"**{title}**\n选择日期：",btns)
 
