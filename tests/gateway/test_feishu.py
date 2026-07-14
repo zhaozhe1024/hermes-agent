@@ -482,6 +482,8 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                       "FeishuWSClient must receive extra_ua_tags for group @mention delivery")
         self.assertEqual(call_kwargs["extra_ua_tags"], ["channel"],
                          "extra_ua_tags must be ['channel'] to enable group event routing")
+        self.assertEqual(call_kwargs["log_level"], "WARNING",
+                         "log_level must be WARNING to prevent WebSocket URL leakage in logs")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_updates_existing_feishu_message(self):

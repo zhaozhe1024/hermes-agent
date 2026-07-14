@@ -2675,6 +2675,12 @@ class FeishuAdapter(BasePlatformAdapter):
             if isinstance(action_value, dict) else None
         )
 
+        if hermes_action == "pa_reminder":
+            return self._handle_pa_reminder_card_action(
+                event=event,
+                action_value=action_value,
+                loop=loop,
+            )
         if hermes_action:
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
         if update_prompt_action:
@@ -2970,6 +2976,59 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
         await self._handle_message_with_guards(synthetic_event)
+
+    def _handle_pa_reminder_card_action(
+        self, *, event: Any, action_value: Dict[str, Any], loop: Any
+    ) -> Any:
+        """Handle a PA reminder card button click with toast response."""
+        from reminder_card_handler import validate_click, dispatch_action
+
+        interaction_id = action_value.get("interaction_id", "")
+        action = action_value.get("action", "")
+        operator = getattr(event, "operator", None)
+        context = getattr(event, "context", None)
+        token = getattr(event, "token", None)
+
+        open_id = str(getattr(operator, "open_id", "") or "")
+        open_chat_id = str(getattr(context, "open_chat_id", "") or "")
+        open_message_id = str(getattr(context, "open_message_id", "") or "")
+        event_token = str(token or "")
+
+        # Validate
+        err = validate_click(
+            interaction_id, open_id, open_chat_id,
+            open_message_id, action, event_token,
+        )
+        if err:
+            logger.warning("[Feishu] PA reminder card validation failed: %s", err)
+            toast = "该操作已处理" if "closed" in err or "duplicate" in err else "操作失败"
+            if P2CardActionTriggerResponse is not None:
+                return P2CardActionTriggerResponse(toast=toast)
+            return None
+
+        # Dispatch asynchronously
+        self._submit_on_loop(
+            loop,
+            self._dispatch_pa_reminder_action(
+                interaction_id=interaction_id,
+                action=action,
+                event_token=event_token,
+            ),
+        )
+        if P2CardActionTriggerResponse is not None:
+            return P2CardActionTriggerResponse(toast="已收到，正在处理")
+        return None
+
+    async def _dispatch_pa_reminder_action(
+        self, *, interaction_id: str, action: str, event_token: str
+    ) -> None:
+        """Dispatch a validated PA reminder action asynchronously."""
+        from reminder_card_handler import dispatch_action
+        try:
+            result = dispatch_action(interaction_id, action, event_token)
+            logger.info("[Feishu] PA reminder action %s → %s", action, result)
+        except Exception as exc:
+            logger.error("[Feishu] PA reminder dispatch failed: %s", exc, exc_info=True)
 
     def _is_card_action_duplicate(self, token: str) -> bool:
         """Return True if this card action token was already processed within the dedup window."""
@@ -4762,7 +4821,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_client = FeishuWSClient(
             app_id=self._app_id,
             app_secret=self._app_secret,
-            log_level=lark.LogLevel.INFO,
+            log_level=lark.LogLevel.WARNING,
             event_handler=self._event_handler,
             domain=domain,
             # Channel SDK signaling tag: without this UA tag the Feishu
@@ -5434,17 +5493,19 @@ async def _standalone_send(
     media_files=None,
     force_document=False,
     idempotency_uuid=None,
+    card=None,
 ):
     """Out-of-process Feishu/Lark delivery via the adapter's send pipeline.
 
     Implements the standalone_sender_fn contract so deliver=feishu cron jobs
     succeed when cron runs separately from the gateway. Builds a transient
     FeishuAdapter, hydrates its lark client, and sends text + native media
-    (images, video, voice, documents). Replaces the legacy _send_feishu helper.
+    (images, video, voice, documents) or an interactive card.
 
     *idempotency_uuid* (optional): a stable UUID for client-side idempotency.
-    Passed into the adapter's metadata so multi-chunk sends produce
-    deterministic per-chunk UUIDs via uuid.uuid5.
+    *card* (optional): an interactive card dict. When provided, sent as
+    ``msg_type=\"interactive\"`` with JSON payload. Mutually exclusive with
+    *message* (card takes precedence when both are present).
     """
     if not FEISHU_AVAILABLE:
         return {"error": "Feishu dependencies not installed. Run: pip install 'hermes-agent[feishu]'"}
@@ -5462,7 +5523,22 @@ async def _standalone_send(
             metadata = None
 
         last_result = None
-        if message.strip():
+
+        # Card takes precedence over message
+        if card is not None:
+            payload = json.dumps(card, ensure_ascii=False)
+            response = await adapter._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=None,
+                metadata=metadata,
+            )
+            last_result = adapter._finalize_send_result(response, "card send failed")
+            if not last_result.success:
+                return {"error": f"Feishu card send failed: {last_result.error}"}
+
+        elif message.strip():
             last_result = await adapter.send(chat_id, message, metadata=metadata)
             if not last_result.success:
                 return {"error": f"Feishu send failed: {last_result.error}"}

@@ -463,3 +463,398 @@ class TestProcessOneClaim:
             # message_id should still be the original
             assert json.loads(raw)["feishu_message_id"] == "om_existing"
             db2.close()
+
+
+# ── Reminder card tests ─────────────────────────────────────────────────────
+
+PA_CLAIM_SINGLE_START = json.dumps({
+    "status": "success", "command": "reminders.claim", "no_send": False,
+    "reminder_id": 50, "reminder_ids": [50], "lease_token": "ltok",
+    "lease_expires_at": "2099-01-01T00:00:00+00:00",
+    "idempotency_key": "card-key-start",
+    "reminders": [{"reminder_id": 50, "kind": "start",
+        "scheduled_at": "2099-01-01T00:00:00+00:00",
+        "expires_at": "2099-01-01T01:00:00+00:00",
+        "idempotency_key": "rk", "product_command": "task.start"}],
+    "tasks": [{"page_id": "pg-001", "title": "Test Task",
+        "start": "2099-01-01T10:00:00+08:00",
+        "end": "2099-01-01T11:00:00+08:00",
+        "assign": "Assign", "done": False}],
+    "markdown": "## 任务提醒\n### 即将开始\n- Test Task",
+})
+
+PA_CLAIM_SINGLE_COMPLETION = json.dumps({
+    "status": "success", "command": "reminders.claim", "no_send": False,
+    "reminder_id": 51, "reminder_ids": [51], "lease_token": "ltok",
+    "lease_expires_at": "2099-01-01T00:00:00+00:00",
+    "idempotency_key": "card-key-completion",
+    "reminders": [{"reminder_id": 51, "kind": "completion",
+        "scheduled_at": "2099-01-01T00:00:00+00:00",
+        "expires_at": "2099-01-01T01:00:00+00:00",
+        "idempotency_key": "rk2", "product_command": "task.completion"}],
+    "tasks": [{"page_id": "pg-002", "title": "Test Task 2",
+        "start": "2099-01-01T10:00:00+08:00",
+        "end": "2099-01-01T11:00:00+08:00",
+        "assign": "Assign", "done": False}],
+    "markdown": "## 任务提醒\n### 到时确认\n- Test Task 2",
+})
+
+PA_CLAIM_SINGLE_SNOOZE = json.dumps({
+    "status": "success", "command": "reminders.claim", "no_send": False,
+    "reminder_id": 52, "reminder_ids": [52], "lease_token": "ltok",
+    "lease_expires_at": "2099-01-01T00:00:00+00:00",
+    "idempotency_key": "card-key-snooze",
+    "reminders": [{"reminder_id": 52, "kind": "start",
+        "scheduled_at": "2099-01-01T00:00:00+00:00",
+        "expires_at": "2099-01-01T01:00:00+00:00",
+        "idempotency_key": "rk3", "product_command": "task.snooze"}],
+    "tasks": [{"page_id": "pg-003", "title": "Snoozed Task",
+        "start": "2099-01-01T10:00:00+08:00",
+        "end": "2099-01-01T11:00:00+08:00",
+        "assign": "Assign", "done": False}],
+    "markdown": "##",
+})
+
+PA_CLAIM_MULTI = json.dumps({
+    "status": "success", "command": "reminders.claim", "no_send": False,
+    "reminder_id": 60, "reminder_ids": [60, 61], "lease_token": "ltok",
+    "lease_expires_at": "2099-01-01T00:00:00+00:00",
+    "idempotency_key": "card-key-multi",
+    "reminders": [
+        {"reminder_id": 60, "kind": "start", "product_command": "task.start",
+         "scheduled_at": "2099-01-01T00:00:00+00:00",
+         "expires_at": "2099-01-01T01:00:00+00:00", "idempotency_key": "rka"},
+        {"reminder_id": 61, "kind": "start", "product_command": "task.start",
+         "scheduled_at": "2099-01-01T00:00:00+00:00",
+         "expires_at": "2099-01-01T01:00:00+00:00", "idempotency_key": "rkb"},
+    ],
+    "tasks": [
+        {"page_id": "pg-004", "title": "T1", "start": "2099-01-01T10:00+08:00",
+         "end": "2099-01-01T11:00+08:00", "assign": "Assign", "done": False},
+        {"page_id": "pg-005", "title": "T2", "start": "2099-01-01T10:00+08:00",
+         "end": "2099-01-01T11:00+08:00", "assign": "Assign", "done": False},
+    ],
+    "markdown": "## Agenda",
+})
+
+
+class TestShouldSendCard:
+    def test_single_start_qualifies(self):
+        from pa_reminder_worker import _should_send_card
+        assert _should_send_card(json.loads(PA_CLAIM_SINGLE_START)) is True
+
+    def test_single_completion_qualifies(self):
+        from pa_reminder_worker import _should_send_card
+        assert _should_send_card(json.loads(PA_CLAIM_SINGLE_COMPLETION)) is True
+
+    def test_multi_reminder_rejected(self):
+        from pa_reminder_worker import _should_send_card
+        assert _should_send_card(json.loads(PA_CLAIM_MULTI)) is False
+
+    def test_no_product_command_rejected(self):
+        from pa_reminder_worker import _should_send_card
+        data = json.loads(PA_CLAIM_SINGLE_START)
+        data["reminders"][0].pop("product_command")
+        assert _should_send_card(data) is False
+
+
+class TestCardBuilding:
+    def test_start_card_build(self):
+        from reminder_card_handler import build_card
+        card = build_card("iid-1", "task.start", "Test Task",
+                          "2026-01-01T10:00+08:00", "2026-01-01T11:00+08:00",
+                          "即将开始")
+        # Verify structure
+        assert card["header"]["title"]["content"] == "即将开始"
+        buttons = card["elements"][1]["actions"]
+        actions = {b["value"]["action"] for b in buttons}
+        assert "start" in actions
+        assert "snooze" in actions
+        assert "reschedule" in actions
+        # All buttons have hermes_action=pa_reminder and interaction_id
+        for b in buttons:
+            assert b["value"]["hermes_action"] == "pa_reminder"
+            assert b["value"]["interaction_id"] == "iid-1"
+
+    def test_completion_card_build(self):
+        from reminder_card_handler import build_card
+        card = build_card("iid-2", "task.completion", "Test Task",
+                          "2026-01-01T10:00+08:00", "2026-01-01T11:00+08:00",
+                          "到时确认")
+        buttons = card["elements"][1]["actions"]
+        actions = {b["value"]["action"] for b in buttons}
+        assert "complete" in actions
+        assert "extend" in actions
+        assert "reschedule" in actions
+
+    def test_snooze_card_no_snooze_button(self):
+        from reminder_card_handler import build_card
+        card = build_card("iid-3", "task.snooze", "Snoozed Task",
+                          "2026-01-01T10:00+08:00", "2026-01-01T11:00+08:00",
+                          "到点提醒")
+        buttons = card["elements"][1]["actions"]
+        actions = {b["value"]["action"] for b in buttons}
+        assert "snooze" not in actions  # no re-snooze
+        assert "start" in actions
+        assert "reschedule" in actions
+
+
+class TestInteractionValidation:
+    def test_all_fail_closed_no_config(self, tmp_path, monkeypatch):
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("FEISHU_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("FEISHU_FRANK_CHAT_ID", raising=False)
+
+        rch.persist_interaction(
+            "iid-v", "dk", 1, "start", "task.start",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["start", "reschedule"],
+        )
+        err = rch.validate_click("iid-v", "ou_frank", "oc_frank", "om_msg",
+                                  "start", "tok-1")
+        assert err is not None  # no config → fail
+
+    def test_token_replay_prevented(self, tmp_path, monkeypatch):
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+
+        rch.persist_interaction(
+            "iid-r", "dk", 1, "start", "task.start",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["start", "reschedule"],
+        )
+        # First claim succeeds
+        assert rch.claim_token("tok-r") is True
+        # Second claim on same token fails
+        assert rch.claim_token("tok-r") is False
+
+    def test_wrong_chat_rejected(self, tmp_path, monkeypatch):
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+
+        rch.persist_interaction(
+            "iid-c", "dk", 1, "start", "task.start",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["start"],
+        )
+        err = rch.validate_click("iid-c", "ou_frank", "oc_wrong", "om_msg",
+                                  "start", "tok-c")
+        assert "chat mismatch" in (err or "").lower()
+
+    def test_wrong_user_rejected(self, tmp_path, monkeypatch):
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+
+        rch.persist_interaction(
+            "iid-u", "dk", 1, "start", "task.start",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["start"],
+        )
+        err = rch.validate_click("iid-u", "ou_stranger", "oc_frank", "om_msg",
+                                  "start", "tok-u")
+        assert "not authorized" in (err or "").lower()
+
+    def test_wrong_message_id_rejected(self, tmp_path, monkeypatch):
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+
+        rch.persist_interaction(
+            "iid-m", "dk", 1, "start", "task.start",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_original", "oc_frank", ["start"],
+        )
+        err = rch.validate_click("iid-m", "ou_frank", "oc_frank", "om_different",
+                                  "start", "tok-m")
+        assert "message_id mismatch" in (err or "").lower()
+
+    def test_disallowed_action_rejected(self, tmp_path, monkeypatch):
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+
+        rch.persist_interaction(
+            "iid-a", "dk", 1, "start", "task.start",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["start", "reschedule"],
+        )
+        err = rch.validate_click("iid-a", "ou_frank", "oc_frank", "om_msg",
+                                  "complete", "tok-a")  # not in allowed
+        assert "not allowed" in (err or "").lower()
+
+    def test_expired_rejected(self, tmp_path, monkeypatch):
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+
+        rch.persist_interaction(
+            "iid-e", "dk", 1, "start", "task.start",
+            "2000-01-01T00:00:00+00:00", "pg-001",  # expired
+            "om_msg", "oc_frank", ["start"],
+        )
+        err = rch.validate_click("iid-e", "ou_frank", "oc_frank", "om_msg",
+                                  "start", "tok-e")
+        assert "expired" in (err or "").lower()
+
+
+# ── Gateway import + E2E tests ──────────────────────────────────────────────
+
+class TestGatewayImport:
+    def test_handler_importable_without_syspath_hacks(self):
+        """Verify reminder_card_handler imports with hermes-agent venv Python."""
+        import subprocess
+        r = subprocess.run(
+            [os.path.join(_H, "hermes-agent/venv/bin/python"), "-c",
+             "import sys; sys.path.insert(0,'/home/frankzhao/.hermes/hermes-agent'); "
+             "sys.path.insert(0,'/home/frankzhao/.hermes/scripts'); "
+             "sys.path.insert(0,'/home/frankzhao/.hermes/skills/calendar-gtd-integration/scripts'); "
+             "import reminder_card_handler; print('OK')"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert "OK" in r.stdout
+
+
+class TestE2ECardDispatch:
+    @pytest.fixture
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+        # Redirect handler DB to tmp_path
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        return rch
+
+    def test_dispatch_snooze(self, setup):
+        rch = setup
+        rch.persist_interaction(
+            "iid-sz", "dk", 1, "start", "task.start",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["snooze", "start"],
+        )
+        with patch("reminder_card_handler._safe_pa_snooze") as m:
+            from safe_runner import RunResult
+            m.return_value = RunResult(0, '{"status":"success"}', "",
+                                        {"status":"success"}, ["pa"], 100)
+            result = rch.dispatch_action("iid-sz", "snooze", "tok-sz")
+        assert result == "succeeded"
+        data = rch.get_interaction("iid-sz")
+        assert data["state"] == "succeeded"
+
+    def test_dispatch_start(self, setup, monkeypatch):
+        rch = setup
+        rch.persist_interaction(
+            "iid-st", "dk", 1, "start", "task.start",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["start"],
+        )
+        with patch("reminder_card_handler.show_task") as m_show, \
+             patch("reminder_card_handler.create_session") as m_cs, \
+             patch("reminder_card_handler.execute_action") as m_exe:
+            m_show.return_value = {"success": True, "version": "v1"}
+            m_cs.return_value = {"success": True, "session_id": "s1", "session": {}}
+            m_exe.return_value = {"success": True, "status": "applied"}
+            result = rch.dispatch_action("iid-st", "start", "tok-st")
+        assert result == "succeeded"
+
+    def test_dispatch_complete(self, setup, monkeypatch):
+        rch = setup
+        rch.persist_interaction(
+            "iid-cp", "dk", 1, "completion", "task.completion",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["complete", "extend", "reschedule"],
+        )
+        with patch("reminder_card_handler.show_task") as m_show, \
+             patch("reminder_card_handler.create_session") as m_cs, \
+             patch("reminder_card_handler.execute_action") as m_exe:
+            m_show.return_value = {"success": True, "version": "v1"}
+            m_cs.return_value = {"success": True, "session_id": "s2", "session": {}}
+            m_exe.return_value = {"success": True, "status": "applied"}
+            result = rch.dispatch_action("iid-cp", "complete", "tok-cp")
+        assert result == "succeeded"
+
+    def test_dispatch_extend(self, setup, monkeypatch):
+        rch = setup
+        rch.persist_interaction(
+            "iid-ex", "dk", 1, "completion", "task.completion",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["extend", "complete"],
+        )
+        with patch("reminder_card_handler.show_task") as m_show, \
+             patch("reminder_card_handler.create_session") as m_cs, \
+             patch("reminder_card_handler.execute_action") as m_exe:
+            m_show.return_value = {"success": True, "version": "v1", "due": "2026-01-01T12:00+08:00"}
+            m_cs.return_value = {"success": True, "session_id": "s3", "session": {}}
+            m_exe.return_value = {"success": True, "status": "confirmation_required"}
+            result = rch.dispatch_action("iid-ex", "extend", "tok-ex")
+        assert result == "confirmation_required"
+
+    def test_dispatch_reschedule(self, setup, monkeypatch):
+        rch = setup
+        rch.persist_interaction(
+            "iid-rs", "dk", 1, "start", "task.start",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["reschedule", "start"],
+        )
+        with patch("reminder_card_handler.show_task") as m_show, \
+             patch("reminder_card_handler.suggest_slots") as m_slots, \
+             patch("reminder_card_handler.create_session") as m_cs, \
+             patch("reminder_card_handler.execute_action") as m_exe:
+            m_show.return_value = {"success": True, "version": "v1"}
+            m_slots.return_value = {"success": True, "slots": [
+                {"start": "2026-01-02T10:00+08:00", "due": "2026-01-02T11:00+08:00"}
+            ]}
+            m_cs.return_value = {"success": True, "session_id": "s4", "session": {}}
+            m_exe.return_value = {"success": True, "status": "confirmation_required"}
+            result = rch.dispatch_action("iid-rs", "reschedule", "tok-rs")
+        assert result == "confirmation_required"
+
+    def test_token_replay_after_completion(self, setup):
+        """Second click on a succeeded interaction fails."""
+        rch = setup
+        rch.persist_interaction(
+            "iid-rp", "dk", 1, "start", "task.start",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["start"],
+        )
+        # First action succeeds
+        with patch("reminder_card_handler.show_task") as m_show, \
+             patch("reminder_card_handler.create_session") as m_cs, \
+             patch("reminder_card_handler.execute_action") as m_exe:
+            m_show.return_value = {"success": True, "version": "v1"}
+            m_cs.return_value = {"success": True, "session_id": "s5", "session": {}}
+            m_exe.return_value = {"success": True, "status": "applied"}
+            rch.dispatch_action("iid-rp", "start", "tok-first")
+
+        # Second click with different token on same interaction
+        with patch("reminder_card_handler.show_task") as m_show:
+            # Should fail validation because state is succeeded (not pending/applying)
+            err = rch.validate_click("iid-rp", "ou_frank", "oc_frank", "om_msg",
+                                      "start", "tok-second")
+            assert err is not None
+            assert "closed" in err.lower()
+
+    def test_dispatch_failure_preserves_token(self, setup):
+        """Failed dispatch doesn't permanently consume the token."""
+        rch = setup
+        rch.persist_interaction(
+            "iid-ft", "dk", 1, "start", "task.start",
+            "2099-01-01T00:00:00+00:00", "pg-001",
+            "om_msg", "oc_frank", ["start"],
+        )
+        with patch("reminder_card_handler.show_task") as m_show:
+            m_show.return_value = {"success": False, "error": "failed"}
+            result = rch.dispatch_action("iid-ft", "start", "tok-ft")
+        assert result == "failed"
+        # Interaction state should be CONFLICT (not succeeded)
+        data = rch.get_interaction("iid-ft")
+        assert data["state"] == "conflict"
