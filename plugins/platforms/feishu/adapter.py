@@ -2981,11 +2981,7 @@ class FeishuAdapter(BasePlatformAdapter):
     def _handle_pa_reminder_card_action(
         self, *, event: Any, action_value: Dict[str, Any], loop: Any
     ) -> Any:
-        from reminder_card_handler import (
-            validate_click, dispatch_action, get_interaction,
-            build_extend_card, build_reschedule_card, build_confirm_card,
-            suggest_slots, S_AWAITING_CONFIRMATION,
-        )
+        from reminder_card_handler import validate_click, dispatch_action, get_interaction
 
         iid = action_value.get("interaction_id", "")
         action = action_value.get("action", "")
@@ -3003,29 +2999,12 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] PA card validation: %s", err)
             return self._make_toast("该操作已处理" if ("closed" in err or "duplicate" in err) else "操作失败")
 
-        # Extract extra params from button value (minutes, slot_index)
         params = {k: v for k, v in action_value.items()
                   if k not in ("hermes_action", "interaction_id", "action")}
 
-        # Secondary cards (synchronous)
-        if action in ("extend", "reschedule"):
-            data = get_interaction(iid)
-            if not data: return self._make_toast("操作失败")
-            if action == "extend":
-                card = build_extend_card(iid, data.get("page_id",""))
-                return self._make_card_response(card)
-            else:
-                slots = suggest_slots(data["page_id"])
-                if slots.get("success") and slots.get("slots"):
-                    card = build_reschedule_card(iid, data.get("page_id",""), slots["slots"])
-                    return self._make_card_response(card)
-                return self._make_toast("无可选时间段")
-
-        # Async dispatch
         dispatched = self._submit_on_loop(
             loop,
-            self._dispatch_pa_reminder_action(iid=iid, action=action,
-                etok=etok, params=params),
+            self._dispatch_pa_reminder_action(iid=iid, action=action, etok=etok, params=params),
         )
         if not dispatched:
             logger.error("[Feishu] PA dispatch scheduling failed for %s", iid)
@@ -3035,31 +3014,30 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _dispatch_pa_reminder_action(
         self, *, iid: str, action: str, etok: str, params: dict
     ) -> None:
-        from reminder_card_handler import (
-            dispatch_action, get_interaction,
-            build_confirm_card, S_AWAITING_CONFIRMATION,
-        )
+        from reminder_card_handler import dispatch_action, get_interaction, update_interaction
+
         try:
             result = dispatch_action(iid, action, etok, params)
-            logger.info("[Feishu] PA action %s → %s", action, result)
+            status = result.get("status","")
+            logger.info("[Feishu] PA action %s → %s", action, status)
 
-            if result == "confirmation_required":
+            # Send secondary card if needed
+            card = result.get("card")
+            if card:
                 data = get_interaction(iid)
-                if data and data.get("proposal"):
-                    card = build_confirm_card(iid, data.get("page_id",""), data["proposal"])
+                if data:
                     sr = await self._send_card_to_chat(data["feishu_chat_id"], card)
                     if sr and sr.success:
-                        from reminder_card_handler import update_interaction
-                        update_interaction(iid, {"confirm_card_message_id": sr.message_id})
+                        update_interaction(iid, {"active_message_id": sr.message_id})
+
         except Exception as exc:
             logger.error("[Feishu] PA dispatch failed: %s", exc, exc_info=True)
 
-    async def _send_card_to_chat(self, chat_id, card, metadata=None):
+    async def _send_card_to_chat(self, chat_id, card):
         try:
             payload = json.dumps(card, ensure_ascii=False)
             r = await self._feishu_send_with_retry(
-                chat_id=chat_id, msg_type="interactive", payload=payload,
-                reply_to=None, metadata=metadata)
+                chat_id=chat_id, msg_type="interactive", payload=payload)
             return self._finalize_send_result(r, "card send")
         except Exception as exc:
             logger.error("[Feishu] Card send failed: %s", exc); return None
@@ -3069,12 +3047,6 @@ class FeishuAdapter(BasePlatformAdapter):
         r = P2CardActionTriggerResponse()
         t = CallBackToast(); t.type = "info"; t.content = content
         r.toast = t; return r
-
-    def _make_card_response(self, card):
-        if P2CardActionTriggerResponse is None or CallBackCard is None: return None
-        r = P2CardActionTriggerResponse()
-        c = CallBackCard(); c.type = "raw"; c.data = card
-        r.card = c; return r
 
     def _is_card_action_duplicate(self, token: str) -> bool:
         """Return True if this card action token was already processed within the dedup window."""
