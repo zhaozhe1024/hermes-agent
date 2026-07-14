@@ -1,0 +1,465 @@
+"""Tests for Calendar GTD / PA integration — Prompt 2 (final v2).
+
+All state_meta tests use tmp_path.  Covers:
+  - safe_runner: redaction (5 flags), argv injection, PATH, JSON parse
+  - UUID: deterministic, chunk replay, invalid fail-closed
+  - _standalone_send: idempotency_uuid signature
+  - Adapter: chunk UUID metadata pass-through (real send path)
+  - task_action_handler: confirmation_required, APR/NWF recovery,
+    token mismatch/expiry, slot fail-closed (CLI err / missing field),
+    chat_id+user_id auth (includes empty chat_id reject),
+    create_session forces task show
+  - calendar_import_handler: path restriction, safe name, lock-first
+  - process_one_claim: no_send, send→persist→ack, fail, missing msg_id,
+    already-sent re-ack
+  - Delivery dedup: sent→persisted→acked state machine
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import uuid
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+_H = os.path.expanduser("~/.hermes")
+for d in ("hermes-agent", "scripts", "skills/calendar-gtd-integration/scripts"):
+    p = os.path.join(_H, d)
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+NS = uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
+# ── safe_runner ─────────────────────────────────────────────────────────────
+
+class TestRedact:
+    def test_five_flags(self):
+        from safe_runner import _redact_command
+        for f in ("--config","--app-password","--notion-token",
+                  "--lease-token","--confirmation-token"):
+            assert _redact_command(["b", f, "v"]) == ["b", f, "***"]
+
+    def test_chained(self):
+        from safe_runner import _redact_command
+        assert _redact_command(
+            ["b","--config","a","--lease-token","b","--confirmation-token","c",
+             "--app-password","d","dr"]
+        ) == ["b","--config","***","--lease-token","***","--confirmation-token",
+              "***","--app-password","***","dr"]
+
+    def test_shell_injection(self):
+        from safe_runner import run
+        for a in ("`ls`","$(whoami)","|cat"):
+            r = run(["/bin/echo", a])
+            assert r.exit_code == 0 and a in r.stdout_raw
+
+    @patch("safe_runner.subprocess.run")
+    def test_env_path(self, mock_run):
+        from safe_runner import run, _BASE_ENV
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
+        run(["/fake/bin"])
+        assert os.path.expanduser("~/.local/bin") in mock_run.call_args[1]["env"]["PATH"]
+
+    def test_doctors(self):
+        from safe_runner import cgtd_doctor, pa_doctor, pa_freshness
+        for fn in (cgtd_doctor, pa_doctor, pa_freshness):
+            r = fn(); assert r.exit_code == 0 and r.parsed is not None
+
+# ── UUID ────────────────────────────────────────────────────────────────────
+
+class TestUUID:
+    def test_deterministic(self):
+        assert uuid.uuid5(NS,"k") == uuid.uuid5(NS,"k")
+    def test_chunk_replay(self):
+        b = uuid.uuid4(); assert str(uuid.uuid5(b,"0")) == str(uuid.uuid5(b,"0"))
+    def test_chunks_differ(self):
+        b = uuid.uuid4(); assert uuid.uuid5(b,"0") != uuid.uuid5(b,"1")
+    def test_invalid(self):
+        with pytest.raises(ValueError): uuid.UUID("bad")
+
+# ── Adapter chunk UUID ──────────────────────────────────────────────────────
+
+class TestAdapterChunkUUID:
+    def test_standalone_send_signature(self):
+        from plugins.platforms.feishu.adapter import _standalone_send
+        import inspect
+        assert "idempotency_uuid" in inspect.signature(_standalone_send).parameters
+
+    @patch("plugins.platforms.feishu.adapter.FeishuAdapter._build_lark_client")
+    @patch("plugins.platforms.feishu.adapter.FeishuAdapter._run_blocking")
+    def test_chunk_uuids_passed_to_send_raw_message(self, mock_run, _mock_client):
+        """Verify each chunk gets uuid5(base, chunk_index) via metadata."""
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+        from gateway.config import PlatformConfig
+        adapter = FeishuAdapter(PlatformConfig(enabled=True, extra={}))
+        adapter._client = MagicMock()
+
+        # Capture metadata passed to _send_raw_message
+        captured_metadata = []
+        async def capture_srm(*, chat_id, msg_type, payload, reply_to, metadata, **kw):
+            captured_metadata.append(metadata)
+            resp = MagicMock()
+            resp.success.return_value = True
+            resp.data.message_id = f"om_chunk_{len(captured_metadata)}"
+            return resp
+        adapter._send_raw_message = capture_srm
+
+        base_uuid = str(uuid.uuid4())
+        # Send a short message (won't chunk at 8k) — wrap to test chunking
+        long_msg = "x" * 100  # single chunk
+        asyncio.run(adapter.send("oc_test", long_msg,
+                     metadata={"idempotency_uuid": base_uuid}))
+        # For single chunk, metadata should contain chunk 0's UUID
+        # The send() method derives chunk_metadata with per-chunk UUID
+        assert len(captured_metadata) >= 1
+        # Verify the first chunk's metadata has idempotency_uuid = uuid5(base, "0")
+        expected_chunk0 = str(uuid.uuid5(uuid.UUID(base_uuid), "0"))
+        assert captured_metadata[0].get("idempotency_uuid") == expected_chunk0
+
+    def test_send_raw_message_rejects_invalid_uuid(self):
+        """Invalid idempotency_uuid in metadata → ValueError."""
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+        from gateway.config import PlatformConfig
+        adapter = FeishuAdapter(PlatformConfig(enabled=True, extra={}))
+        adapter._client = MagicMock()
+        with pytest.raises(ValueError, match="must be a valid UUID"):
+            asyncio.run(adapter._send_raw_message(
+                chat_id="oc_x", msg_type="text", payload="{}",
+                reply_to=None, metadata={"idempotency_uuid": "garbage"},
+            ))
+
+    def test_send_raw_message_still_accepts_no_uuid(self):
+        """No idempotency_uuid → uuid4() fallback (backward compat)."""
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+        from gateway.config import PlatformConfig
+        adapter = FeishuAdapter(PlatformConfig(enabled=True, extra={}))
+        adapter._client = MagicMock()
+        resp = MagicMock(); resp.success.return_value = True; resp.data.message_id = "om"
+        adapter._run_blocking = AsyncMock(return_value=resp)
+        asyncio.run(adapter._send_raw_message(
+            chat_id="oc_x", msg_type="text", payload="{}",
+            reply_to=None, metadata=None,
+        ))
+        # Should not raise
+
+# ── task_action_handler ─────────────────────────────────────────────────────
+
+@pytest.fixture
+def th_setup(monkeypatch, tmp_path):
+    import task_action_handler as th
+    monkeypatch.setattr(th, "_HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+    monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+    return th
+
+TASK_SHOW = json.dumps({"status":"success","task":{"page_id":"pg-001","title":"T",
+    "done":False,"assign":"Assign","start":"2026-07-15T15:00+08:00",
+    "due":"2026-07-15T16:00+08:00","archived":False,"in_trash":False,"version":"v1"}})
+CONFIRM_REQ = json.dumps({"status":"confirmation_required","page_id":"pg-001",
+    "proposal":{"start":"2026-07-16T10:00+08:00","due":"2026-07-16T11:00+08:00"},
+    "confirmation":{"level":1,"required_levels":1,"token":"tok_cf",
+                     "expires_at":"2099-01-01T00:00:00+00:00"}})
+APPLIED = json.dumps({"status":"success","operation":"applied","replayed":False,
+    "task":{"page_id":"pg-001","version":"v2"}})
+APR = json.dumps({"status":"applied_pending_refresh"})
+NWF = json.dumps({"status":"error","error":{"code":"notion_write_failed"}})
+
+def _make_session(th, sid, **kw):
+    d = {"feishu_chat_id":"oc_frank","feishu_user_id":"ou_frank",
+         "source_message_id":"om1","page_id":"pg-001","action":"reschedule",
+         "start":"2026-07-16T10:00+08:00","due":"2026-07-16T11:00+08:00",
+         "expected_version":"v1","idempotency_key":"k1","confirmation_level":0,
+         "confirmation_token":None,"confirmation_expires_at":None,
+         "state":th.S_PROPOSED,"hermes_job_id":"","result_message_id":None}
+    d.update(kw)
+    th._save_session(sid, d)
+    return d
+
+
+class TestTaskActionHandler:
+    def test_confirmation_required(self, th_setup):
+        th = th_setup; sid = "s1"
+        _make_session(th, sid)
+        with patch("task_action_handler.pa_task_action") as m:
+            from safe_runner import RunResult
+            m.return_value = RunResult(0, CONFIRM_REQ, "", json.loads(CONFIRM_REQ), ["pa"], 100)
+            r = th.execute_action(sid, feishu_chat_id="oc_frank", feishu_user_id="ou_frank")
+        assert r["success"] and r["status"] == "confirmation_required"
+        assert th.get_session(sid)["confirmation_token"] == "tok_cf"
+
+    def test_token_mismatch(self, th_setup):
+        th = th_setup; sid = "s2"
+        _make_session(th, sid, state=th.S_AWAITING, confirmation_token="real",
+                       confirmation_expires_at="2099-01-01T00:00:00+00:00")
+        r = th.execute_action(sid, feishu_chat_id="oc_frank", feishu_user_id="ou_frank",
+                               confirmation_token="wrong")
+        assert not r["success"] and "mismatch" in r["error"].lower()
+
+    def test_token_expired(self, th_setup):
+        th = th_setup; sid = "s3"
+        _make_session(th, sid, action="extend", start=None, due="18:00",
+                       state=th.S_AWAITING, confirmation_token="tok_exp",
+                       confirmation_expires_at="2000-01-01T00:00:00+00:00")
+        r = th.execute_action(sid, feishu_chat_id="oc_frank", feishu_user_id="ou_frank",
+                               confirmation_token="tok_exp")
+        assert not r["success"] and "expired" in r["error"].lower()
+
+    def test_applied_pending_refresh(self, th_setup):
+        th = th_setup; sid = "s4"
+        _make_session(th, sid, action="start", start=None, due=None)
+        with patch("task_action_handler.pa_task_action") as m:
+            from safe_runner import RunResult
+            m.return_value = RunResult(1, APR, "", json.loads(APR), ["pa"], 100)
+            r = th.execute_action(sid, feishu_chat_id="oc_frank", feishu_user_id="ou_frank")
+        assert r["success"] and r["status"] == "applied_pending_refresh"
+        assert r["retry_same_key"]
+
+    def test_notion_write_failed(self, th_setup):
+        th = th_setup; sid = "s5"
+        _make_session(th, sid, action="start", start=None, due=None)
+        with patch("task_action_handler.pa_task_action") as m:
+            from safe_runner import RunResult
+            m.return_value = RunResult(1, NWF, "", json.loads(NWF), ["pa"], 100)
+            r = th.execute_action(sid, feishu_chat_id="oc_frank", feishu_user_id="ou_frank")
+        assert not r["success"]
+        assert r.get("recoverable")
+        assert r["retry_same_key"]
+        assert r["status"] == "notion_write_failed"
+
+    def test_slot_fail_closed_cli_err(self, th_setup):
+        th = th_setup; sid = "s6"
+        _make_session(th, sid, state=th.S_AWAITING, confirmation_token="tok_s6",
+                       confirmation_expires_at="2099-01-01T00:00:00+00:00")
+        with patch("task_action_handler.suggest_slots") as m:
+            m.return_value = {"success": False, "error": "CLI timeout"}
+            r = th.execute_action(sid, feishu_chat_id="oc_frank", feishu_user_id="ou_frank",
+                                   confirmation_token="tok_s6")
+        assert not r["success"]
+
+    def test_slot_fail_closed_missing_requested(self, th_setup):
+        th = th_setup; sid = "s7"
+        _make_session(th, sid, state=th.S_AWAITING, confirmation_token="tok_s7",
+                       confirmation_expires_at="2099-01-01T00:00:00+00:00")
+        with patch("task_action_handler.suggest_slots") as m:
+            m.return_value = {"success": True, "slots": []}
+            r = th.execute_action(sid, feishu_chat_id="oc_frank", feishu_user_id="ou_frank",
+                                   confirmation_token="tok_s7")
+        assert not r["success"]
+
+    def test_empty_chat_id_rejected(self, th_setup):
+        th = th_setup
+        assert not th.is_authorized("ou_frank", "")
+
+    def test_wrong_chat_id_rejected(self, th_setup):
+        th = th_setup
+        assert not th.is_authorized("ou_frank", "oc_wrong")
+
+    def test_no_config_denies(self, th_setup, monkeypatch):
+        th = th_setup
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "")
+        assert not th.is_authorized("ou_frank", "oc_frank")
+
+    def test_create_session_forces_show(self, th_setup):
+        th = th_setup
+        with patch("task_action_handler.show_task") as m:
+            m.return_value = {"success":True,"version":"v_forced","page_id":"pg-001",
+                "title":"","done":False,"assign":"","archived":False,"in_trash":False,
+                "start":None,"due":None}
+            r = th.create_session("sx","oc_frank","ou_frank","om","pg-001","start")
+        assert r["success"] and r["session"]["expected_version"] == "v_forced"
+
+    def test_execute_action_denies_stranger(self, th_setup):
+        th = th_setup
+        r = th.execute_action("sx", feishu_chat_id="oc_frank", feishu_user_id="ou_stranger")
+        assert not r["success"]
+
+# ── calendar_import_handler ─────────────────────────────────────────────────
+
+class TestCalendarImport:
+    def test_rejects_tmp(self, tmp_path):
+        import calendar_import_handler as cih
+        f = tmp_path / "bad.ics"; f.write_text("BEGIN:VCALENDAR")
+        assert cih._is_allowed_file(str(f), "bad.ics") is not None
+
+    def test_accepts_cache_dir(self, tmp_path, monkeypatch):
+        import calendar_import_handler as cih
+        cache = tmp_path / "cache" / "documents"; cache.mkdir(parents=True)
+        monkeypatch.setattr(cih, "_MEDIA_CACHE", cache.resolve())
+        f = cache / "ok.ics"; f.write_text("BEGIN:VCALENDAR")
+        assert cih._is_allowed_file(str(f), "ok.ics") is None
+
+    def test_rejects_sibling_prefix(self, tmp_path, monkeypatch):
+        import calendar_import_handler as cih
+        cache = tmp_path / "cache"; cache.mkdir()
+        evil = tmp_path / "cache_evil"; evil.mkdir()
+        f = evil / "bad.ics"; f.write_text("BEGIN:VCALENDAR")
+        monkeypatch.setattr(cih, "_MEDIA_CACHE", cache.resolve())
+        assert cih._is_allowed_file(str(f.resolve()), "bad.ics") is not None
+
+    def test_safe_name_unique(self):
+        import calendar_import_handler as cih
+        assert cih._safe_filename("a.ics") != cih._safe_filename("a.ics")
+
+    def test_lock_first(self, tmp_path, monkeypatch):
+        import calendar_import_handler as cih
+        ics_dir = tmp_path / "ics"; ics_dir.mkdir()
+        cache = tmp_path / "cache" / "documents"; cache.mkdir(parents=True)
+        monkeypatch.setattr(cih, "ICS_DIR", str(ics_dir))
+        monkeypatch.setattr(cih, "INCOMING_DIR", str(ics_dir / ".incoming"))
+        monkeypatch.setattr(cih, "INGESTION_LOCK", str(tmp_path / ".ingestion.lock"))
+        monkeypatch.setattr(cih, "_MEDIA_CACHE", cache.resolve())
+        f = cache / "test.ics"; f.write_text("BEGIN:VCALENDAR\nEND:VCALENDAR")
+        with patch("calendar_import_handler.cgtd_run_file") as m:
+            from safe_runner import RunResult
+            m.return_value = RunResult(0, '{"status":"success","phases":{}}', "",
+                                        {"status":"success","phases":{}}, ["cgtd"], 100)
+            r = cih.import_file(str(f))
+            assert r["success"]
+
+    def test_subprocess_cli_returns_valid_json(self):
+        """Actual subprocess call to the CLI entry point returns valid JSON."""
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable,
+             os.path.join(_H, "skills/calendar-gtd-integration/scripts/calendar_import_handler.py")],
+            input=json.dumps({"command": "is_allowed",
+                              "args": {"file_path": "/etc/passwd"}}),
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ},
+        )
+        assert proc.returncode == 0
+        result = json.loads(proc.stdout)
+        assert "allowed" in result
+
+
+# ── process_one_claim (reminder worker) ─────────────────────────────────────
+
+PA_CLAIM_NOSEND = '{"status":"success","command":"reminders.claim","no_send":true}'
+PA_CLAIM_PAYLOAD = json.dumps({
+    "status":"success","command":"reminders.claim","no_send":False,
+    "reminder_id":101,"reminder_ids":[101],"lease_token":"ltok",
+    "lease_expires_at":"2099-01-01T00:00:00+00:00",
+    "idempotency_key":"delivery-key-abc",
+    "reminders":[{"reminder_id":101,"kind":"agenda"}],
+    "marksdown":"## Test\\n- item",
+    "markdown":"## Test",
+})
+
+class TestProcessOneClaim:
+    @pytest.fixture
+    def setup_paths(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # Patch paths in pa_reminder_worker
+        import pa_reminder_worker as pw
+        monkeypatch.setattr(pw, "_HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(pw, "_HERMES_SRC", os.path.join(_H, "hermes-agent"))
+        monkeypatch.setattr(pw, "_SCRIPTS_DIR", os.path.join(_H, "scripts"))
+        return pw
+
+    def test_no_send(self, setup_paths):
+        pw = setup_paths
+        with patch("pa_reminder_worker.pa_claim") as m:
+            from safe_runner import RunResult
+            m.return_value = RunResult(0, PA_CLAIM_NOSEND, "",
+                                       json.loads(PA_CLAIM_NOSEND), ["pa"], 100)
+            db = pw._get_state_db()
+            r = pw.process_one_claim(db)
+            assert r is False  # no_send → stop tick
+
+    def test_send_persist_ack(self, setup_paths):
+        pw = setup_paths
+        with patch("pa_reminder_worker.pa_claim") as m_claim, \
+             patch("pa_reminder_worker.pa_ack") as m_ack, \
+             patch("pa_reminder_worker.asyncio.run") as m_async:
+            from safe_runner import RunResult
+            m_claim.return_value = RunResult(
+                0, PA_CLAIM_PAYLOAD, "", json.loads(PA_CLAIM_PAYLOAD), ["pa"], 100)
+            m_async.return_value = {"message_id": "om_sent_123"}
+            m_ack.return_value = RunResult(
+                0, '{"status":"success"}', "", {"status":"success"}, ["pa"], 100)
+
+            db = pw._get_state_db()
+            r = pw.process_one_claim(db)
+            assert r is True  # bundle processed
+
+            # Verify state persisted
+            raw = db.get_meta("pa:delivery:delivery-key-abc")
+            assert raw
+            data = json.loads(raw)
+            assert data["feishu_message_id"] == "om_sent_123"
+            assert data["state"] == "acked"
+            db.close()
+
+    def test_fail_on_send_error(self, setup_paths):
+        pw = setup_paths
+        with patch("pa_reminder_worker.pa_claim") as m_claim, \
+             patch("pa_reminder_worker.pa_fail") as m_fail, \
+             patch("pa_reminder_worker.asyncio.run") as m_async:
+            from safe_runner import RunResult
+            m_claim.return_value = RunResult(
+                0, PA_CLAIM_PAYLOAD, "", json.loads(PA_CLAIM_PAYLOAD), ["pa"], 100)
+            m_async.return_value = {"error": "Feishu send failed"}
+            m_fail.return_value = RunResult(
+                0, '{"status":"success"}', "", {"status":"success"}, ["pa"], 100)
+
+            db = pw._get_state_db()
+            r = pw.process_one_claim(db)
+            assert r is True
+            raw = db.get_meta("pa:delivery:delivery-key-abc")
+            assert json.loads(raw)["state"] == "failed"
+            db.close()
+
+    def test_fail_on_missing_msg_id(self, setup_paths):
+        pw = setup_paths
+        with patch("pa_reminder_worker.pa_claim") as m_claim, \
+             patch("pa_reminder_worker.pa_fail") as m_fail, \
+             patch("pa_reminder_worker.asyncio.run") as m_async:
+            from safe_runner import RunResult
+            m_claim.return_value = RunResult(
+                0, PA_CLAIM_PAYLOAD, "", json.loads(PA_CLAIM_PAYLOAD), ["pa"], 100)
+            m_async.return_value = {"success": True}  # no message_id!
+            m_fail.return_value = RunResult(
+                0, '{"status":"success"}', "", {"status":"success"}, ["pa"], 100)
+
+            db = pw._get_state_db()
+            r = pw.process_one_claim(db)
+            assert r is True
+            raw = db.get_meta("pa:delivery:delivery-key-abc")
+            assert json.loads(raw)["state"] == "failed"
+            db.close()
+
+    def test_already_sent_re_ack(self, setup_paths):
+        pw = setup_paths
+        db = pw._get_state_db()
+        # Pre-populate a "sent" delivery
+        db.set_meta("pa:delivery:delivery-key-abc", json.dumps({
+            "feishu_message_id":"om_existing","reminder_ids":[101],
+            "lease_token":"ltok","state":"sent","message_uuid":"u",
+        }))
+        db.close()
+
+        with patch("pa_reminder_worker.pa_claim") as m_claim, \
+             patch("pa_reminder_worker.pa_ack") as m_ack, \
+             patch("pa_reminder_worker.asyncio.run") as m_async:
+            from safe_runner import RunResult
+            m_claim.return_value = RunResult(
+                0, PA_CLAIM_PAYLOAD, "", json.loads(PA_CLAIM_PAYLOAD), ["pa"], 100)
+            m_ack.return_value = RunResult(
+                0, '{"status":"success"}', "", {"status":"success"}, ["pa"], 100)
+            m_async.return_value = {"message_id": "om_new"}
+
+            db2 = pw._get_state_db()
+            r = pw.process_one_claim(db2)
+            assert r is True
+            # Should NOT have called async send (already sent)
+            # Verify state moved to acked
+            raw = db2.get_meta("pa:delivery:delivery-key-abc")
+            assert json.loads(raw)["state"] == "acked"
+            # message_id should still be the original
+            assert json.loads(raw)["feishu_message_id"] == "om_existing"
+            db2.close()

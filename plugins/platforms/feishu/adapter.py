@@ -1891,7 +1891,12 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a Feishu message."""
+        """Send a Feishu message.
+
+        When *metadata* carries ``idempotency_uuid``, each chunk uses
+        ``uuid.uuid5(base_uuid, str(chunk_index))`` so that multi-chunk
+        deliveries produce distinct but deterministically replayable UUIDs.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -1899,8 +1904,20 @@ class FeishuAdapter(BasePlatformAdapter):
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
 
+        # Resolve base idempotency UUID once for chunk derivation.
+        base_uuid_str = (metadata or {}).get("idempotency_uuid")
+        base_uuid: Optional[uuid.UUID] = None
+        if base_uuid_str is not None:
+            base_uuid = uuid.UUID(base_uuid_str)
+
         try:
-            for chunk in chunks:
+            for chunk_idx, chunk in enumerate(chunks):
+                chunk_metadata = dict(metadata) if metadata else {}
+                if base_uuid is not None:
+                    chunk_metadata["idempotency_uuid"] = str(
+                        uuid.uuid5(base_uuid, str(chunk_idx))
+                    )
+
                 msg_type, payload = self._build_outbound_payload(chunk)
                 try:
                     response = await self._feishu_send_with_retry(
@@ -1908,7 +1925,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type=msg_type,
                         payload=payload,
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=chunk_metadata,
                     )
                 except Exception as exc:
                     if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
@@ -1919,7 +1936,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=chunk_metadata,
                     )
                 if (
                     msg_type == "post"
@@ -1932,7 +1949,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=chunk_metadata,
                     )
                 last_response = response
 
@@ -4614,12 +4631,26 @@ class FeishuAdapter(BasePlatformAdapter):
         if not effective_reply_to and metadata and metadata.get("thread_id"):
             effective_reply_to = metadata.get("reply_to_message_id")
         reply_in_thread = bool((metadata or {}).get("thread_id"))
+
+        # Resolve idempotency UUID from metadata. Validated with uuid.UUID();
+        # invalid values raise (fail closed), absent values fall through to
+        # uuid4() in each branch for backward compatibility.
+        idem_uuid_str = (metadata or {}).get("idempotency_uuid")
+        idem_uuid: Optional[str] = None
+        if idem_uuid_str is not None:
+            try:
+                idem_uuid = str(uuid.UUID(idem_uuid_str))
+            except (ValueError, AttributeError):
+                raise ValueError(
+                    f"Feishu idempotency_uuid must be a valid UUID string, got: {idem_uuid_str!r}"
+                ) from None
+
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
                 msg_type=msg_type,
                 reply_in_thread=reply_in_thread,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=idem_uuid or str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
@@ -4633,7 +4664,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 receive_id=_thread_id,
                 msg_type=msg_type,
                 content=payload,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=idem_uuid or str(uuid.uuid4()),
             )
             request = self._build_create_message_request("thread_id", body)
         else:
@@ -4649,7 +4680,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 receive_id=receive_id,
                 msg_type=msg_type,
                 content=payload,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=idem_uuid or str(uuid.uuid4()),
             )
             request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)
@@ -5402,6 +5433,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    idempotency_uuid=None,
 ):
     """Out-of-process Feishu/Lark delivery via the adapter's send pipeline.
 
@@ -5409,6 +5441,10 @@ async def _standalone_send(
     succeed when cron runs separately from the gateway. Builds a transient
     FeishuAdapter, hydrates its lark client, and sends text + native media
     (images, video, voice, documents). Replaces the legacy _send_feishu helper.
+
+    *idempotency_uuid* (optional): a stable UUID for client-side idempotency.
+    Passed into the adapter's metadata so multi-chunk sends produce
+    deterministic per-chunk UUIDs via uuid.uuid5.
     """
     if not FEISHU_AVAILABLE:
         return {"error": "Feishu dependencies not installed. Run: pip install 'hermes-agent[feishu]'"}
@@ -5419,7 +5455,11 @@ async def _standalone_send(
         domain_name = getattr(adapter, "_domain_name", "feishu")
         domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
         adapter._client = adapter._build_lark_client(domain)
-        metadata = {"thread_id": thread_id} if thread_id else None
+        metadata = {"thread_id": thread_id} if thread_id else {}
+        if idempotency_uuid is not None:
+            metadata["idempotency_uuid"] = idempotency_uuid
+        if not metadata:
+            metadata = None
 
         last_result = None
         if message.strip():
