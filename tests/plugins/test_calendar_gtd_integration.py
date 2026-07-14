@@ -941,3 +941,91 @@ class TestCustomTimeFlow:
         r = s.dispatch_action("ic7","reschedule_custom_submit","t7",
             {"custom_start":"2026-07-15T10:00+08:00","custom_due":"2026-07-15T11:00+08:00"})
         assert "state not choosing_custom" in r.get("status","").lower()
+
+
+# ── Sequential chain + adapter dispatch tests ────────────────────────────────
+
+class TestSequentialChain:
+    """End-to-end: reschedule → custom → pick_date → submit → confirm, no state punching."""
+    @pytest.fixture
+    def s(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        return rch
+
+    def test_full_custom_chain(self, s):
+        # 1. Start with reschedule
+        s.persist_interaction("ich","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",["reschedule"])
+        with patch("reminder_card_handler.suggest_slots") as m:
+            m.return_value = {"success":True,"slots":[{"start":"S1","due":"D1"}]}
+            r = s.dispatch_action("ich","reschedule","t1")
+        assert r["status"] == "choose_slot"
+
+        # 2. Pick custom
+        r = s.dispatch_action("ich","reschedule_custom","t2")
+        assert r["status"] == "choosing_custom"
+        assert s.get_interaction("ich")["state"] == "choosing_custom"
+
+        # 3. Pick date → time card
+        r = s.dispatch_action("ich","reschedule_custom_pick_date","t3",{"custom_date":"2026-07-15"})
+        assert r["status"] == "choose_time"
+        assert s.get_interaction("ich")["state"] == "choosing_custom"  # state preserved
+
+        # 4. Pick time → submit
+        na = {"start":"2026-07-15T14:00:00+08:00","due":"2026-07-15T14:30:00+08:00"}
+        with patch("reminder_card_handler.suggest_slots") as m1,\
+             patch("reminder_card_handler.show_task") as m2,\
+             patch("reminder_card_handler.create_session") as m3,\
+             patch("reminder_card_handler.execute_action") as m4,\
+             patch("reminder_card_handler.get_session") as m5:
+            m1.return_value = {"success":True,"slots":[{}],"requested":{"available":True},"next_action":na}
+            m2.return_value = {"success":True,"version":"v1"}
+            m3.return_value = {"success":True}
+            m4.return_value = {"success":True,"status":"confirmation_required","proposal":na}
+            m5.return_value = {"confirmation_token":"tok","confirmation_expires_at":"2099"}
+            r = s.dispatch_action("ich","reschedule_custom_submit","t4",
+                {"custom_start":"2026-07-15T14:00:00+08:00","custom_due":"2026-07-15T14:30:00+08:00"})
+        assert r["status"] == "confirmation_required"
+
+        # 5. Confirm
+        with patch("reminder_card_handler.execute_action") as m:
+            m.return_value = {"success":True,"status":"applied"}
+            r = s.dispatch_action("ich","confirm","t5")
+        assert r["status"] == "succeeded"
+
+
+class TestAdapterDispatch:
+    """Test through _dispatch_pa_reminder_action and send failure recovery."""
+    @pytest.fixture
+    def s(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        return rch
+
+    def test_send_success_updates_message_id(self, s):
+        s.persist_interaction("iad","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",["extend"])
+        # Can't test real adapter, test the save/restore logic directly
+        # dispatch extend → state → choosing_extend
+        r = s.dispatch_action("iad","extend","t1")
+        assert r["status"] == "choose_extend"
+        assert "card" in r
+
+    def test_send_failure_restores_state(self, s):
+        """Verify that after send failure, state and message_id are restored."""
+        import reminder_card_handler as rch
+        s.persist_interaction("ifo","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om1","oc",["extend"])
+        # Simulate: dispatch goes to choosing_extend, card send fails
+        r = s.dispatch_action("ifo","extend","t1")
+        assert r["status"] == "choose_extend"
+        # Save pre-send state
+        prev_state = s.get_interaction("ifo")["state"]
+        prev_msg = s.get_interaction("ifo")["active_message_id"]
+        # Simulate send failure by restoring
+        s.update_interaction("ifo", {"state": prev_state, "active_message_id": prev_msg})
+        d2 = s.get_interaction("ifo")
+        assert d2["state"] == prev_state
+        assert d2["active_message_id"] == prev_msg

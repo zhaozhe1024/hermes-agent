@@ -3026,6 +3026,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 data = get_interaction(iid)
                 if data:
                     iuuid = self._derive_card_uuid(iid, status)
+                    prev_state = data.get("state")
+                    prev_msg_id = data.get("active_message_id")
                     sr = await self._send_card_to_chat(
                         chat_id=data["feishu_chat_id"], card=card,
                         idempotency_uuid=iuuid,
@@ -3033,7 +3035,11 @@ class FeishuAdapter(BasePlatformAdapter):
                     if sr and sr.success:
                         update_interaction(iid, {"active_message_id": sr.message_id})
                     else:
-                        logger.error("[Feishu] Card delivery failed for %s", iid)
+                        logger.error("[Feishu] Card delivery failed for %s, restoring state", iid)
+                        update_interaction(iid, {
+                            "active_message_id": prev_msg_id,
+                            "state": prev_state,
+                        })
         except Exception as exc:
             logger.error("[Feishu] PA dispatch failed: %s", exc, exc_info=True)
 

@@ -68,13 +68,18 @@ def build_custom_date_card(iid,title):
     return _card("选择日期",f"**{title}**\n选择日期：",btns)
 
 def build_custom_time_card(iid, title, custom_date):
-    """Time picker: common slots on the chosen date."""
+    """Time picker: 30-min slots on the chosen date."""
     btns=[]
     for h in range(8,18):
-        s=f"{custom_date}T{h:02d}:00:00+08:00"
-        e=f"{custom_date}T{h+1:02d}:00:00+08:00"
-        btns.append(_btn(f"{h:02d}:00 - {h+1:02d}:00","reschedule_custom_submit","primary" if h==8 else "default",iid,
-                          custom_date=custom_date,custom_start=s,custom_due=e))
+        for m in (0,30):
+            if h==17 and m==30: continue
+            s=f"{custom_date}T{h:02d}:{m:02d}:00+08:00"
+            total=h*60+m+30
+            eh,tem=divmod(total,60)
+            e=f"{custom_date}T{eh:02d}:{tem:02d}:00+08:00"
+            btns.append(_btn(f"{h:02d}:{m:02d} – {eh:02d}:{tem:02d}","reschedule_custom_submit",
+                              "primary" if h==8 and m==0 else "default",iid,
+                              custom_date=custom_date,custom_start=s,custom_due=e))
     btns.append(_btn("返回推荐时间","reschedule_cancel","danger",iid))
     return _card("选择时间",f"**{title}**\n{custom_date}\n选择时间段：",btns)
 def build_confirm_card(iid,title,proposal):
@@ -126,7 +131,9 @@ def update_interaction(iid,upd):
     finally: d.close()
 
 # ── Atomic CAS ──
-def atomic_claim(iid,token,expected_state):
+def atomic_claim(iid,token,expected_state,next_state=None):
+    """Atomically claim token and CAS state. next_state defaults to applying."""
+    if next_state is None: next_state = S_APPLYING
     db=_db()
     try:
         c=db._conn; c.execute("BEGIN IMMEDIATE")
@@ -135,7 +142,7 @@ def atomic_claim(iid,token,expected_state):
             if not row or not row[0]: c.rollback(); return "not found"
             data=json.loads(row[0] if isinstance(row,dict) else row[0])
             if data.get("state")!=expected_state: c.rollback(); return f"state not {expected_state} ({data.get('state')})"
-            data["state"]=S_APPLYING
+            data["state"]=next_state
             c.execute("INSERT INTO state_meta (key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(_ik(iid),json.dumps(data)))
             c.execute("INSERT OR IGNORE INTO state_meta (key,value) VALUES(?,?)",(_tk(token),"1"))
             if c.execute("SELECT changes()").fetchone()[0]==0: c.rollback(); return "duplicate token"
@@ -143,7 +150,7 @@ def atomic_claim(iid,token,expected_state):
             v=c.execute("SELECT value FROM state_meta WHERE key=?",(_ik(iid),)).fetchone()
             if v and v[0]:
                 vd=json.loads(v[0] if isinstance(v,dict) else v[0])
-                if vd.get("state")!=S_APPLYING: return "state persistence failed"
+                if vd.get("state")!=next_state: return "state persistence failed"
             return None
         except Exception: c.rollback(); raise
     except Exception as e: logger.error("atomic_claim: %s",e); return str(e)
@@ -208,13 +215,13 @@ def dispatch_action(iid,action,token,params=None):
         return _do_reschedule(d,sl[idx])
 
     if action=="reschedule_custom":
-        err=atomic_claim(iid,token,S_CHOOSING_SLOT)
+        err=atomic_claim(iid,token,S_CHOOSING_SLOT,next_state=S_CHOOSING_CUSTOM)
         if err: return {"status":err}
         update_interaction(iid,{"state":S_CHOOSING_CUSTOM})
         return {"status":"choosing_custom","card":build_custom_date_card(iid,d.get("task_title",d["page_id"]))}
 
     if action=="reschedule_custom_pick_date":
-        err=atomic_claim(iid,token,S_CHOOSING_CUSTOM)
+        err=atomic_claim(iid,token,S_CHOOSING_CUSTOM,next_state=S_CHOOSING_CUSTOM)
         if err: return {"status":err}
         custom_date=params.get("custom_date","")
         if not custom_date: update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_date"}
@@ -222,7 +229,7 @@ def dispatch_action(iid,action,token,params=None):
         return {"status":"choose_time","card":build_custom_time_card(iid,d.get("task_title",d["page_id"]),custom_date)}
 
     if action=="reschedule_cancel":
-        err=atomic_claim(iid,token,S_CHOOSING_CUSTOM)
+        err=atomic_claim(iid,token,S_CHOOSING_CUSTOM,next_state=S_CHOOSING_SLOT)
         if err: return {"status":err}
         sr=suggest_slots(d["page_id"])
         if not sr.get("success") or not sr.get("slots"): update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_slots"}
