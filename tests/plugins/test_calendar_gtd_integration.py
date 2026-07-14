@@ -1007,56 +1007,76 @@ class TestAdapterDispatch:
         return rch
 
     def test_real_dispatch_send_success(self, s):
-        """Real adapter dispatch with mocked _send_card_to_chat → success updates message_id."""
+        """Real adapter dispatch: pending → extend → success → choosing_extend + new msg_id."""
         import plugins.platforms.feishu.adapter as adp
         adapter = object.__new__(adp.FeishuAdapter)
         adapter._derive_card_uuid = lambda iid, ctx: "uuid-"+iid
+        import reminder_card_handler as rch
+        s.persist_interaction("iads","dk",1,"completion","task.completion","2099-01-01T00:00:00+00:00","pg","om","oc_frank",["extend"])
 
-        s.persist_interaction("iads","dk",1,"completion","task.completion","2099-01-01T00:00:00+00:00","pg","om","oc",["extend"])
-
-        class FakeResult:
+        class FR:
             success=True; message_id="new-msg-id"
-
-        async def fake_send(**kw): return FakeResult()
+        async def fake_send(**kw): return FR()
 
         with patch.object(adapter, "_send_card_to_chat", new=fake_send):
             async def run():
                 await adapter._dispatch_pa_reminder_action(iid="iads",action="extend",etok="t1",params={})
             import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(run())
-            loop.close()
+            loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+            loop.run_until_complete(run()); loop.close()
 
         d = s.get_interaction("iads")
+        assert d["state"] == "choosing_extend"
         assert d["active_message_id"] == "new-msg-id"
 
-    def test_real_dispatch_send_failure_restores(self, s):
-        """Real adapter dispatch with send failure → state restored for retry."""
+    def test_real_dispatch_failure_restores_then_retry_succeeds(self, s):
+        """First extend: send fails → back to pending. Second extend: send succeeds → choosing_extend."""
         import plugins.platforms.feishu.adapter as adp
         adapter = object.__new__(adp.FeishuAdapter)
         adapter._derive_card_uuid = lambda iid, ctx: "uuid-"+iid
+        import reminder_card_handler as rch
+        s.persist_interaction("iadf","dk",1,"completion","task.completion","2099-01-01T00:00:00+00:00","pg","om","oc_frank",["extend"])
 
-        s.persist_interaction("iadf","dk",1,"completion","task.completion","2099-01-01T00:00:00+00:00","pg","om","oc",["extend"])
-
-        async def fake_send_fail(**kw): return None  # send failed
-
-        with patch.object(adapter, "_send_card_to_chat", new=fake_send_fail):
-            async def run():
-                await adapter._dispatch_pa_reminder_action(iid="iadf",action="extend",etok="t2",params={})
+        # 1st attempt: send fails
+        async def fake_fail(**kw): return None
+        with patch.object(adapter, "_send_card_to_chat", new=fake_fail):
+            async def run(): await adapter._dispatch_pa_reminder_action(iid="iadf",action="extend",etok="tx",params={})
             import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(run())
-            loop.close()
+            loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+            loop.run_until_complete(run()); loop.close()
 
         d = s.get_interaction("iadf")
-        # State restored: should be choosing_extend (from extend dispatch)
-        assert d["state"] == "choosing_extend"
-        # Old message_id preserved
-        assert d["active_message_id"] == "om"
+        assert d["state"] == "pending"  # restored
+        assert d["active_message_id"] == "om"  # original
 
-        # Verify card can be retried (state allows it)
-        from reminder_card_handler import validate_click
-        err = validate_click("iadf","ou_frank","oc_frank","om","extend_confirm","tok-retry")
-        assert err is None  # old card still valid
+        # 2nd attempt with new token: send succeeds
+        class FR: success=True; message_id="new-ok"
+        async def fake_ok(**kw): return FR()
+        with patch.object(adapter, "_send_card_to_chat", new=fake_ok):
+            async def run(): await adapter._dispatch_pa_reminder_action(iid="iadf",action="extend",etok="ty",params={})
+            loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+            loop.run_until_complete(run()); loop.close()
+
+        d2 = s.get_interaction("iadf")
+        assert d2["state"] == "choosing_extend"
+        assert d2["active_message_id"] == "new-ok"
+
+
+def test_custom_submit_exact_args_to_suggest_slots():
+    """Verify arbitrary custom_start/custom_due pass through to suggest_slots unchanged."""
+    import reminder_card_handler as rch, tempfile
+    td = tempfile.mkdtemp()
+    import os as _os
+    _os.environ["FEISHU_ALLOWED_USERS"] = "ou_frank"
+    _os.environ["FEISHU_FRANK_CHAT_ID"] = "oc_frank"
+    rch._HERMES_HOME = td
+    rch.persist_interaction("ict","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc_frank",[])
+    rch.update_interaction("ict",{"state":"choosing_custom"})
+    calls = []
+    def fake(*a, **kw): calls.append(kw); return {"success":True,"slots":[],"requested":{"available":False}}
+    with patch("reminder_card_handler.suggest_slots", side_effect=fake):
+        rch.dispatch_action("ict","reschedule_custom_submit","tx",{
+            "custom_start":"2026-08-01T14:30:00+08:00","custom_due":"2026-08-01T16:00:00+08:00"})
+    assert calls
+    assert calls[-1].get("start") == "2026-08-01T14:30:00+08:00"
+    assert calls[-1].get("due") == "2026-08-01T16:00:00+08:00"

@@ -68,20 +68,28 @@ def build_custom_date_card(iid,title):
     return _card("选择日期",f"**{title}**\n选择日期：",btns)
 
 def build_custom_time_card(iid, title, custom_date):
-    """Time picker: 30-min slots on the chosen date."""
-    btns=[]
-    for h in range(8,18):
-        for m in (0,30):
-            if h==17 and m==30: continue
-            s=f"{custom_date}T{h:02d}:{m:02d}:00+08:00"
-            total=h*60+m+30
-            eh,tem=divmod(total,60)
-            e=f"{custom_date}T{eh:02d}:{tem:02d}:00+08:00"
-            btns.append(_btn(f"{h:02d}:{m:02d} – {eh:02d}:{tem:02d}","reschedule_custom_submit",
-                              "primary" if h==8 and m==0 else "default",iid,
-                              custom_date=custom_date,custom_start=s,custom_due=e))
-    btns.append(_btn("返回推荐时间","reschedule_cancel","danger",iid))
-    return _card("选择时间",f"**{title}**\n{custom_date}\n选择时间段：",btns)
+    """Card with date_picker + start/end time pickers + submit button."""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"content": "自定义时间", "tag": "plain_text"}, "template": "blue"},
+        "elements": [
+            {"tag": "markdown", "content": f"**{title}**\n选择具体时间："},
+            {"tag": "date_picker", "initial_date": custom_date,
+             "placeholder": {"tag": "plain_text", "content": "选择日期"}},
+            {"tag": "picker_time", "initial_time": "09:00",
+             "placeholder": {"tag": "plain_text", "content": "开始时间"}},
+            {"tag": "picker_time", "initial_time": "10:00",
+             "placeholder": {"tag": "plain_text", "content": "结束时间"}},
+            {"tag": "action", "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "确认"},
+                 "type": "primary", "value": {"hermes_action": "pa_reminder",
+                 "interaction_id": iid, "action": "reschedule_custom_submit"}},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "返回推荐时间"},
+                 "type": "danger", "value": {"hermes_action": "pa_reminder",
+                 "interaction_id": iid, "action": "reschedule_cancel"}},
+            ]}
+        ],
+    }
 def build_confirm_card(iid,title,proposal):
     s,d=proposal.get("start","?"),proposal.get("due","?")
     return _card("确认操作",f"**{title}**\n{s} → {d}\n确认？",[_btn("确认","confirm","primary",iid),_btn("取消","cancel","danger",iid)])

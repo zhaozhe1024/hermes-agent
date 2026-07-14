@@ -3017,26 +3017,24 @@ class FeishuAdapter(BasePlatformAdapter):
         from reminder_card_handler import dispatch_action, get_interaction, update_interaction
 
         try:
+            before = get_interaction(iid)
             result = dispatch_action(iid, action, etok, params)
             status = result.get("status","")
             logger.info("[Feishu] PA action %s → %s", action, status)
 
             card = result.get("card")
-            if card:
-                data = get_interaction(iid)
-                if data:
-                    # Save snapshot for recovery on failure
-                    snapshot = {"state": data.get("state"), "active_message_id": data.get("active_message_id")}
-                    iuuid = self._derive_card_uuid(iid, status)
-                    sr = await self._send_card_to_chat(
-                        chat_id=data["feishu_chat_id"], card=card,
-                        idempotency_uuid=iuuid,
-                    )
-                    if sr and sr.success:
-                        update_interaction(iid, {"active_message_id": sr.message_id})
-                    else:
-                        logger.error("[Feishu] Card delivery failed for %s, restoring", iid)
-                        update_interaction(iid, snapshot)
+            if card and before:
+                snapshot = {"state": before.get("state"), "active_message_id": before.get("active_message_id")}
+                iuuid = self._derive_card_uuid(iid, status)
+                sr = await self._send_card_to_chat(
+                    chat_id=before["feishu_chat_id"], card=card,
+                    idempotency_uuid=iuuid,
+                )
+                if sr and sr.success:
+                    update_interaction(iid, {"active_message_id": sr.message_id})
+                else:
+                    logger.error("[Feishu] Card delivery failed for %s, restoring", iid)
+                    update_interaction(iid, snapshot)
         except Exception as exc:
             logger.error("[Feishu] PA dispatch failed: %s", exc, exc_info=True)
 
