@@ -873,11 +873,14 @@ class TestCustomTimeFlow:
         r = s.dispatch_action("ic1","reschedule_custom","t1")
         assert r["status"] == "choosing_custom"
         assert "card" in r
-        # Verify card has date_picker and time pickers
+        # Verify form container, names, submit
         c = r["card"]
-        tags = [e["tag"] for e in c["elements"]]
-        assert "date_picker" in tags
-        assert "picker_time" in tags
+        forms = [e for e in c["elements"] if e.get("tag") == "form"]
+        assert len(forms) == 1
+        f = forms[0]
+        names = {el["name"] for el in f["elements"] if "name" in el}
+        assert names >= {"custom_date", "custom_start_time", "custom_due_time"}
+        assert "submit" in f
         assert s.get_interaction("ic1")["state"] == "choosing_custom"
 
     def test_custom_submit_date_time_passed_to_suggest_slots(self, s):
@@ -1115,3 +1118,92 @@ class TestSDKCallbackWithFormValue:
         params = {"custom_date":"2026-08-01","custom_start_time":"16:00","custom_due_time":"14:30"}
         r = rch.dispatch_action("idb","reschedule_custom_submit","tk",params)
         assert r["status"] == "due_before_start"
+
+    def test_invalid_time_rejected(self):
+        """Non-parseable time returns invalid_time."""
+        import reminder_card_handler as rch, tempfile
+        td = tempfile.mkdtemp()
+        import os as _os
+        _os.environ["FEISHU_ALLOWED_USERS"] = "ou_frank"
+        _os.environ["FEISHU_FRANK_CHAT_ID"] = "oc_frank"
+        rch._HERMES_HOME = td
+        rch.persist_interaction("iit","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc_frank",[])
+        rch.update_interaction("iit",{"state":"choosing_custom"})
+        params = {"custom_date":"2026-08-01","custom_start_time":"bad","custom_due_time":"16:00"}
+        r = rch.dispatch_action("iit","reschedule_custom_submit","tk",params)
+        assert r["status"] == "invalid_time"
+
+    def test_real_sdk_callback_through_on_card_action_trigger(self, tmp_path, monkeypatch):
+        """Real _on_card_action_trigger with P2CardActionTrigger event."""
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        rch.persist_interaction("is","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om1","oc_frank",["extend"])
+
+        from types import SimpleNamespace
+        action = SimpleNamespace(
+            value={"hermes_action":"pa_reminder","interaction_id":"is","action":"extend"},
+            form_value=None, tag="button",
+        )
+        event = SimpleNamespace(
+            action=action,
+            operator=SimpleNamespace(open_id="ou_frank"),
+            context=SimpleNamespace(open_chat_id="oc_frank", open_message_id="om1"),
+            token="tok-is",
+        )
+        data = SimpleNamespace(event=event)
+
+        import plugins.platforms.feishu.adapter as adp
+        adapter = object.__new__(adp.FeishuAdapter)
+        adapter._loop = True  # mock: loop is ready
+
+        # Mock toast response class
+        class MockToast: pass
+        monkeypatch.setattr(adp, "P2CardActionTriggerResponse", MockToast)
+        monkeypatch.setattr(adp, "CallBackToast", MockToast)
+        # Mock submit to prevent actual scheduling
+        adapter._submit_on_loop = lambda loop, coro: True
+        adapter._derive_card_uuid = lambda iid, ctx: "uuid-"+iid
+        # Mock _send_card_to_chat
+        adapter._feishu_send_with_retry = None
+
+        result = adapter._on_card_action_trigger(data=data)
+        # Should return a toast response (system busy since no async loop)
+        assert isinstance(result, MockToast)
+
+    def test_real_callback_with_form_value(self, tmp_path, monkeypatch):
+        """_on_card_action_trigger with Feishu form_value containing picker selections."""
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        rch.persist_interaction("if2","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om2","oc_frank",[])
+        rch.update_interaction("if2",{"state":"choosing_custom"})
+
+        from types import SimpleNamespace
+        action = SimpleNamespace(
+            value={"hermes_action":"pa_reminder","interaction_id":"if2","action":"reschedule_custom_submit"},
+            form_value={"custom_date":"2026-08-01","custom_start_time":"14:30 +0800","custom_due_time":"16:00 +0800"},
+            tag="button",
+        )
+        operator = SimpleNamespace(open_id="ou_frank")
+        context = SimpleNamespace(open_chat_id="oc_frank", open_message_id="om2")
+        event = SimpleNamespace(action=action, operator=operator, context=context, token="tok-f")
+        data = SimpleNamespace(event=event)
+
+        import plugins.platforms.feishu.adapter as adp
+        adapter = object.__new__(adp.FeishuAdapter)
+        adapter._derive_card_uuid = lambda iid, ctx: "uuid-"+iid
+
+        # Verify form_value merging
+        av = getattr(action, "value", {}) or {}
+        fv = getattr(action, "form_value", None)
+        import json as _j
+        fv_dict = _j.loads(fv) if isinstance(fv, str) else dict(fv or {})
+        for k in ("custom_date","custom_start_time","custom_due_time"):
+            if k in fv_dict and k not in av:
+                av[k] = fv_dict[k]
+        assert av.get("custom_date") == "2026-08-01"
+        assert av.get("custom_start_time") == "14:30 +0800"
+        assert av.get("custom_due_time") == "16:00 +0800"

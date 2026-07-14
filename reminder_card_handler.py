@@ -60,27 +60,30 @@ def build_reschedule_card(iid,title,slots):
     btns.append(_btn("自定义时间","reschedule_custom","default",iid,task_title=title))
     return _card("重新安排时间",f"**{title}**\n选择新时间：",btns)
 def build_custom_time_card(iid, title):
-    """Card with date_picker + start/end time pickers + submit."""
+    """Card with form-wrapped date_picker + time pickers + submit."""
     return {
         "config": {"wide_screen_mode": True},
         "header": {"title": {"content": "自定义时间", "tag": "plain_text"}, "template": "blue"},
-        "elements": [
-            {"tag": "markdown", "content": f"**{title}**\n选择具体时间："},
-            {"tag": "date_picker", "name": "custom_date",
-             "placeholder": {"tag": "plain_text", "content": "选择日期"}},
-            {"tag": "picker_time", "name": "custom_start_time",
-             "placeholder": {"tag": "plain_text", "content": "开始时间"}},
-            {"tag": "picker_time", "name": "custom_due_time",
-             "placeholder": {"tag": "plain_text", "content": "结束时间"}},
-            {"tag": "action", "actions": [
+        "elements": [{
+            "tag": "form",
+            "elements": [
+                {"tag": "markdown", "content": f"**{title}**\n选择具体时间："},
+                {"tag": "date_picker", "name": "custom_date",
+                 "required": True, "placeholder": {"tag": "plain_text", "content": "选择日期"}},
+                {"tag": "picker_time", "name": "custom_start_time",
+                 "required": True, "placeholder": {"tag": "plain_text", "content": "开始时间"}},
+                {"tag": "picker_time", "name": "custom_due_time",
+                 "required": True, "placeholder": {"tag": "plain_text", "content": "结束时间"}},
+            ],
+            "submit": {"tag": "action", "actions": [
                 {"tag": "button", "text": {"tag": "plain_text", "content": "确认"},
                  "type": "primary", "value": {"hermes_action": "pa_reminder",
                  "interaction_id": iid, "action": "reschedule_custom_submit"}},
                 {"tag": "button", "text": {"tag": "plain_text", "content": "返回推荐时间"},
                  "type": "danger", "value": {"hermes_action": "pa_reminder",
                  "interaction_id": iid, "action": "reschedule_cancel"}},
-            ]}
-        ],
+            ]},
+        }],
     }
 def build_confirm_card(iid,title,proposal):
     s,d=proposal.get("start","?"),proposal.get("due","?")
@@ -236,13 +239,21 @@ def dispatch_action(iid,action,token,params=None):
         due_time=params.get("custom_due_time","")
         if not custom_date or not start_time or not due_time:
             update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_time"}
-        custom_start=f"{custom_date}T{start_time}:00+08:00"
-        custom_due=f"{custom_date}T{due_time}:00+08:00"
-        # Validate: due > start, same day
+        # Parse Feishu time format: "14:30" or "14:30 +0800"
+        import re as _re
+        def _parse_t(tv):
+            m=_re.match(r"(\d{1,2}:\d{2})", str(tv))
+            return m.group(1) if m else None
+        st=_parse_t(start_time); dt=_parse_t(due_time)
+        if not st or not dt:
+            update_interaction(iid,{"state":S_CONFLICT}); return {"status":"invalid_time"}
+        custom_start=f"{custom_date}T{st}:00+08:00"
+        custom_due=f"{custom_date}T{dt}:00+08:00"
         try:
             sd=datetime.fromisoformat(custom_start); dd=datetime.fromisoformat(custom_due)
             if dd<=sd: update_interaction(iid,{"state":S_CONFLICT}); return {"status":"due_before_start"}
-        except: pass
+        except:
+            update_interaction(iid,{"state":S_CONFLICT}); return {"status":"invalid_time"}
         sr=suggest_slots(d["page_id"],start=custom_start,due=custom_due)
         if not sr.get("success"): update_interaction(iid,{"state":S_CONFLICT}); return {"status":"slots_error"}
         requested=sr.get("requested",{})
