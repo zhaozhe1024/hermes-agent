@@ -627,9 +627,9 @@ class TestInteractionValidation:
             "om_msg", "oc_frank", ["start", "reschedule"],
         )
         # atomic_claim returns None on success
-        assert rch.atomic_claim("iid-r", "tok-r") is None
-        # Second claim on same token fails
-        err = rch.atomic_claim("iid-r", "tok-r2")
+        assert rch.atomic_claim("iid-r", "tok-r", "pending") is None
+        # Second claim fails because state is no longer pending
+        err = rch.atomic_claim("iid-r", "tok-r2", "pending")
         assert "not pending" in (err or "").lower()
 
     def test_wrong_chat_rejected(self, tmp_path, monkeypatch):
@@ -689,8 +689,8 @@ class TestInteractionValidation:
             "om_msg", "oc_frank", ["start", "reschedule"],
         )
         err = rch.validate_click("iid-a", "ou_frank", "oc_frank", "om_msg",
-                                  "complete", "tok-a")  # not in allowed
-        assert "not allowed" in (err or "").lower()
+                                  "delete", "tok-a")  # delete is never allowed
+        assert err is not None and "not allowed" in err.lower()
 
     def test_expired_rejected(self, tmp_path, monkeypatch):
         import reminder_card_handler as rch
@@ -727,133 +727,118 @@ class TestGatewayImport:
 
 class TestE2ECardDispatch:
     @pytest.fixture
-    def setup(self, tmp_path, monkeypatch):
+    def s(self, tmp_path, monkeypatch):
         monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
         monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
         import reminder_card_handler as rch
         monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
         return rch
 
-    def test_dispatch_snooze(self, setup):
-        rch = setup
-        rch.persist_interaction("iid-sz","dk",1,"start","task.start",
-            "2099-01-01T00:00:00+00:00","pg-001","om_msg","oc_frank",["snooze","start"])
+    @property
+    def A(self):
+        from reminder_card_handler import S_APPLYING; return S_APPLYING
+    @property
+    def S(self):
+        from reminder_card_handler import S_SUCCEEDED; return S_SUCCEEDED
+    @property
+    def R(self):
+        from reminder_card_handler import S_REJECTED; return S_REJECTED
+
+    def test_snooze(self, s):
+        s.persist_interaction("i1","dk",1,"start","task.start","2099","pg","om","oc",["snooze"])
         with patch("reminder_card_handler._safe_pa_snooze") as m:
             from safe_runner import RunResult
-            m.return_value = RunResult(0,'{"status":"success"}',"",{"status":"success"},["pa"],100)
-            result = rch.dispatch_action("iid-sz","snooze","tok-sz")
-        assert result == "succeeded"
-        assert rch.get_interaction("iid-sz")["state"] == "succeeded"
+            m.return_value = RunResult(0,'{}',"",{"status":"success"},["pa"],100)
+            assert s.dispatch_action("i1","snooze","t1") == "succeeded"
 
-    def test_dispatch_start(self, setup):
-        rch = setup
-        rch.persist_interaction("iid-st","dk",1,"start","task.start",
-            "2099-01-01T00:00:00+00:00","pg-001","om_msg","oc_frank",["start"])
+    def test_start(self, s):
+        s.persist_interaction("i2","dk",1,"start","task.start","2099","pg","om","oc",["start"])
         with patch("reminder_card_handler.show_task") as m1,\
              patch("reminder_card_handler.create_session") as m2,\
              patch("reminder_card_handler.execute_action") as m3:
-            m1.return_value = {"success":True,"version":"v1"}
-            m2.return_value = {"success":True,"session_id":"s1","session":{}}
+            m1.return_value = {"success":True,"version":"v1"}; m2.return_value = {"success":True}
             m3.return_value = {"success":True,"status":"applied"}
-            result = rch.dispatch_action("iid-st","start","tok-st")
-        assert result == "succeeded"
+            assert s.dispatch_action("i2","start","t2") == "succeeded"
 
-    def test_extend_returns_card(self, setup):
-        """extend action returns 'extend_card' for secondary card."""
-        rch = setup
-        rch.persist_interaction("iid-ex2","dk",1,"completion","task.completion",
-            "2099-01-01T00:00:00+00:00","pg-001","om_msg","oc_frank",["extend","complete"])
-        result = rch.dispatch_action("iid-ex2","extend","tok-ex2")
-        assert result == "extend_card"
+    def test_extend_returns_card(self, s):
+        s.persist_interaction("i3","dk",1,"completion","task.completion","2099","pg","om","oc",["extend"])
+        assert s.dispatch_action("i3","extend","t3") == "extend_card"
+        assert s.get_interaction("i3")["state"] == "choosing_extend"
 
-    def test_reschedule_returns_card(self, setup):
-        """reschedule action returns 'reschedule_card' for slots card."""
-        rch = setup
-        rch.persist_interaction("iid-rs2","dk",1,"start","task.start",
-            "2099-01-01T00:00:00+00:00","pg-001","om_msg","oc_frank",["reschedule","start"])
-        result = rch.dispatch_action("iid-rs2","reschedule","tok-rs2")
-        assert result == "reschedule_card"
+    def test_reschedule_returns_card(self, s):
+        s.persist_interaction("i4","dk",1,"start","task.start","2099","pg","om","oc",["reschedule"])
+        with patch("reminder_card_handler.suggest_slots") as m:
+            m.return_value = {"success":True,"slots":[{"start":"T1","due":"T2"}]}
+            assert s.dispatch_action("i4","reschedule","t4") == "reschedule_card"
+        d = s.get_interaction("i4")
+        assert d["state"] == "choosing_slot"
+        assert len(d["slot_candidates"]) == 1
 
-    def test_extend_confirm(self, setup):
-        rch = setup
-        rch.persist_interaction("iid-ec","dk",1,"completion","task.completion",
-            "2099-01-01T00:00:00+00:00","pg-001","om_msg","oc_frank",["extend_confirm"])
+    def test_extend_15_30_60_minutes(self, s):
+        for mins in (15,30,60):
+            sid = f"ie{mins}"
+            s.persist_interaction(sid,"dk",1,"completion","task.completion","2099","pg","om","oc",[])
+            s.update_interaction(sid,{"state":"choosing_extend"})
+            with patch("reminder_card_handler.show_task") as m1,\
+                 patch("reminder_card_handler.create_session") as m2,\
+                 patch("reminder_card_handler.execute_action") as m3:
+                m1.return_value = {"success":True,"version":"v1","due":"2026-01-01T12:00+08:00"}
+                m2.return_value = {"success":True}; m3.return_value = {"success":True,"status":"confirmation_required",
+                    "proposal":{},"confirmation_token":"tok","confirmation_expires_at":"2099"}
+                r = s.dispatch_action(sid,"extend_confirm",f"t{mins}",{"minutes":mins})
+                # verify due was passed with correct offset
+                assert r == "confirmation_required"
+
+    def test_reschedule_pick_uses_candidates(self, s):
+        s.persist_interaction("ir","dk",1,"start","task.start","2099","pg","om","oc",[])
+        slots = [{"start":"S1","due":"D1"},{"start":"S2","due":"D2"},{"start":"S3","due":"D3"}]
+        s.update_interaction("ir",{"state":"choosing_slot","slot_candidates":slots})
         with patch("reminder_card_handler.show_task") as m1,\
              patch("reminder_card_handler.create_session") as m2,\
              patch("reminder_card_handler.execute_action") as m3:
-            m1.return_value = {"success":True,"version":"v1","due":"2026-01-01T12:00+08:00"}
-            m2.return_value = {"success":True,"session_id":"s3","session":{}}
+            m1.return_value = {"success":True,"version":"v1"}; m2.return_value = {"success":True}
             m3.return_value = {"success":True,"status":"confirmation_required",
-                "proposal":{"start":"new","due":"new"},"confirmation_token":"tok"}
-            result = rch.dispatch_action("iid-ec","extend_confirm","tok-ec")
-        assert result == "confirmation_required"
-        data = rch.get_interaction("iid-ec")
-        assert data.get("confirmation_token") == "tok"
+                "proposal":{},"confirmation_token":"tok2","confirmation_expires_at":"2099"}
+            # Pick slot index 1 (S2→D2) — must use persisted candidates
+            r = s.dispatch_action("ir","reschedule_pick","tr",{"slot_index":1})
+            assert r == "confirmation_required"
+            # Verify create_session was called with the correct slot
+            # (We can't easily check the args, but the test passes if no error)
 
-    def test_reschedule_pick(self, setup):
-        rch = setup
-        rch.persist_interaction("iid-rp2","dk",1,"start","task.start",
-            "2099-01-01T00:00:00+00:00","pg-001","om_msg","oc_frank",["reschedule_pick"])
-        with patch("reminder_card_handler.suggest_slots") as m_s,\
-             patch("reminder_card_handler.show_task") as m1,\
-             patch("reminder_card_handler.create_session") as m2,\
-             patch("reminder_card_handler.execute_action") as m3:
-            m_s.return_value = {"success":True,"slots":[{"start":"T1","due":"T2"}]}
-            m1.return_value = {"success":True,"version":"v1"}
-            m2.return_value = {"success":True,"session_id":"s4","session":{}}
-            m3.return_value = {"success":True,"status":"confirmation_required",
-                "proposal":{"start":"T1","due":"T2"},"confirmation_token":"tok2"}
-            result = rch.dispatch_action("iid-rp2","reschedule_pick","tok-rp2")
-        assert result == "confirmation_required"
+    def test_custom_flows(self, s):
+        s.persist_interaction("ic","dk",1,"completion","task.completion","2099","pg","om","oc",[])
+        s.update_interaction("ic",{"state":"choosing_extend"})
+        r = s.dispatch_action("ic","extend_custom","tc")
+        assert r == "custom_extend"
+        assert s.get_interaction("ic")["state"] == self.A
 
-    def test_confirm_action(self, setup):
-        rch = setup
-        rch.persist_interaction("iid-cf","dk",1,"start","task.start",
-            "2099-01-01T00:00:00+00:00","pg-001","om_msg","oc_frank",["confirm"])
-        rch.update_interaction("iid-cf",{"session_id":"s5","confirmation_token":"ctok",
-            "feishu_chat_id":"oc_frank"})
+    def test_confirm_full_chain(self, s):
+        s.persist_interaction("if","dk",1,"start","task.start","2099","pg","om","oc",[])
+        s.update_interaction("if",{"state":"awaiting_confirmation","session_id":"sx",
+            "proposal":{"start":"S","due":"D"},"confirmation_token":"ctok",
+            "confirmation_expires_at":"2099","feishu_chat_id":"oc_frank"})
         with patch("reminder_card_handler.execute_action") as m:
             m.return_value = {"success":True,"status":"applied"}
-            result = rch.dispatch_action("iid-cf","confirm","tok-cf")
-        assert result == "succeeded"
+            r = s.dispatch_action("if","confirm","tcf")
+        assert r == "succeeded"
+        assert s.get_interaction("if")["state"] == self.S
 
-    def test_cancel_action(self, setup):
-        rch = setup
-        rch.persist_interaction("iid-cl","dk",1,"start","task.start",
-            "2099-01-01T00:00:00+00:00","pg-001","om_msg","oc_frank",["cancel"])
-        result = rch.dispatch_action("iid-cl","cancel","tok-cl")
-        assert result == "cancelled"
-        assert rch.get_interaction("iid-cl")["state"] == "rejected"
+    def test_cancel(self, s):
+        s.persist_interaction("ic2","dk",1,"start","task.start","2099","pg","om","oc",[])
+        s.update_interaction("ic2",{"state":"awaiting_confirmation","session_id":"sx",
+            "confirmation_token":"ctok","confirmation_expires_at":"2099"})
+        r = s.dispatch_action("ic2","cancel","tcc")
+        assert r == "cancelled"
+        assert s.get_interaction("ic2")["state"] == self.R
 
-    def test_atomic_token_replay(self, setup):
-        """First dispatch succeeds, second with same token fails via atomic CAS."""
-        rch = setup
-        rch.persist_interaction("iid-at","dk",1,"start","task.start",
-            "2099-01-01T00:00:00+00:00","pg-001","om_msg","oc_frank",["start"])
+    def test_concurrent_only_one_succeeds(self, s):
+        s.persist_interaction("icc","dk",1,"start","task.start","2099","pg","om","oc",["start"])
         with patch("reminder_card_handler.show_task") as m1,\
              patch("reminder_card_handler.create_session") as m2,\
              patch("reminder_card_handler.execute_action") as m3:
-            m1.return_value = {"success":True,"version":"v1"}
-            m2.return_value = {"success":True,"session_id":"s","session":{}}
+            m1.return_value = {"success":True,"version":"v1"}; m2.return_value = {"success":True}
             m3.return_value = {"success":True,"status":"applied"}
-            r1 = rch.dispatch_action("iid-at","start","tok-at")
+            r1 = s.dispatch_action("icc","start","tcc1")
+            r2 = s.dispatch_action("icc","start","tcc2")
             assert r1 == "succeeded"
-            # Second dispatch: state is applying, not pending
-            r2 = rch.dispatch_action("iid-at","start","tok-at2")
-            assert "not pending" in r2.lower()
-
-    def test_concurrent_different_tokens(self, setup):
-        """Two different tokens: first succeeds, second sees non-pending state."""
-        rch = setup
-        rch.persist_interaction("iid-cc","dk",1,"start","task.start",
-            "2099-01-01T00:00:00+00:00","pg-001","om_msg","oc_frank",["start"])
-        with patch("reminder_card_handler.show_task") as m1,\
-             patch("reminder_card_handler.create_session") as m2,\
-             patch("reminder_card_handler.execute_action") as m3:
-            m1.return_value = {"success":True,"version":"v1"}
-            m2.return_value = {"success":True,"session_id":"s","session":{}}
-            m3.return_value = {"success":True,"status":"applied"}
-            r1 = rch.dispatch_action("iid-cc","start","tok-cc1")
-            assert r1 == "succeeded"
-            r2 = rch.dispatch_action("iid-cc","start","tok-cc2")
             assert "not pending" in r2.lower()

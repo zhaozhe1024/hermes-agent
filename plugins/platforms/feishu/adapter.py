@@ -2981,114 +2981,100 @@ class FeishuAdapter(BasePlatformAdapter):
     def _handle_pa_reminder_card_action(
         self, *, event: Any, action_value: Dict[str, Any], loop: Any
     ) -> Any:
-        """Handle a PA reminder card button click with proper toast."""
-        from reminder_card_handler import validate_click, dispatch_action, get_interaction
-        from reminder_card_handler import build_extend_card, build_reschedule_card, build_confirm_card
-        from reminder_card_handler import suggest_slots
+        from reminder_card_handler import (
+            validate_click, dispatch_action, get_interaction,
+            build_extend_card, build_reschedule_card, build_confirm_card,
+            suggest_slots, S_AWAITING_CONFIRMATION,
+        )
 
-        interaction_id = action_value.get("interaction_id", "")
+        iid = action_value.get("interaction_id", "")
         action = action_value.get("action", "")
         operator = getattr(event, "operator", None)
         context = getattr(event, "context", None)
         token = getattr(event, "token", None)
 
-        open_id = str(getattr(operator, "open_id", "") or "")
-        open_chat_id = str(getattr(context, "open_chat_id", "") or "")
-        open_message_id = str(getattr(context, "open_message_id", "") or "")
-        event_token = str(token or "")
+        oid = str(getattr(operator, "open_id", "") or "")
+        chat = str(getattr(context, "open_chat_id", "") or "")
+        mid = str(getattr(context, "open_message_id", "") or "")
+        etok = str(token or "")
 
-        err = validate_click(interaction_id, open_id, open_chat_id,
-                             open_message_id, action, event_token)
+        err = validate_click(iid, oid, chat, mid, action, etok)
         if err:
             logger.warning("[Feishu] PA card validation: %s", err)
             return self._make_toast("该操作已处理" if ("closed" in err or "duplicate" in err) else "操作失败")
 
-        # For secondary card actions (extend, reschedule), dispatch synchronously
-        # to build the response card inline
-        if action in ("extend", "reschedule"):
-            data = get_interaction(interaction_id)
-            if not data:
-                return self._make_toast("操作失败")
+        # Extract extra params from button value (minutes, slot_index)
+        params = {k: v for k, v in action_value.items()
+                  if k not in ("hermes_action", "interaction_id", "action")}
 
+        # Secondary cards (synchronous)
+        if action in ("extend", "reschedule"):
+            data = get_interaction(iid)
+            if not data: return self._make_toast("操作失败")
             if action == "extend":
-                card = build_extend_card(interaction_id, data.get("page_id",""))
+                card = build_extend_card(iid, data.get("page_id",""))
                 return self._make_card_response(card)
-            elif action == "reschedule":
+            else:
                 slots = suggest_slots(data["page_id"])
                 if slots.get("success") and slots.get("slots"):
-                    card = build_reschedule_card(interaction_id, data.get("page_id",""), slots["slots"])
+                    card = build_reschedule_card(iid, data.get("page_id",""), slots["slots"])
                     return self._make_card_response(card)
                 return self._make_toast("无可选时间段")
 
-        # For atomic actions, dispatch asynchronously
+        # Async dispatch
         dispatched = self._submit_on_loop(
             loop,
-            self._dispatch_pa_reminder_action(
-                interaction_id=interaction_id, action=action, event_token=event_token,
-            ),
+            self._dispatch_pa_reminder_action(iid=iid, action=action,
+                etok=etok, params=params),
         )
         if not dispatched:
-            logger.error("[Feishu] PA reminder dispatch scheduling failed for %s", interaction_id)
+            logger.error("[Feishu] PA dispatch scheduling failed for %s", iid)
             return self._make_toast("系统繁忙，请重试")
-
         return self._make_toast("已收到，正在处理")
 
     async def _dispatch_pa_reminder_action(
-        self, *, interaction_id: str, action: str, event_token: str
+        self, *, iid: str, action: str, etok: str, params: dict
     ) -> None:
-        from reminder_card_handler import dispatch_action, get_interaction
-        from reminder_card_handler import build_confirm_card, build_reschedule_card
-        from reminder_card_handler import suggest_slots
-
+        from reminder_card_handler import (
+            dispatch_action, get_interaction,
+            build_confirm_card, S_AWAITING_CONFIRMATION,
+        )
         try:
-            result = dispatch_action(interaction_id, action, event_token)
+            result = dispatch_action(iid, action, etok, params)
             logger.info("[Feishu] PA action %s → %s", action, result)
 
-            # Handle results that need secondary cards
-            if result in ("confirmation_required",):
-                data = get_interaction(interaction_id)
+            if result == "confirmation_required":
+                data = get_interaction(iid)
                 if data and data.get("proposal"):
-                    card = build_confirm_card(interaction_id, data.get("page_id",""), data["proposal"])
-                    await self._send_card_to_chat(data["feishu_chat_id"], card, None)
-
+                    card = build_confirm_card(iid, data.get("page_id",""), data["proposal"])
+                    sr = await self._send_card_to_chat(data["feishu_chat_id"], card)
+                    if sr and sr.success:
+                        from reminder_card_handler import update_interaction
+                        update_interaction(iid, {"confirm_card_message_id": sr.message_id})
         except Exception as exc:
             logger.error("[Feishu] PA dispatch failed: %s", exc, exc_info=True)
 
-    async def _send_card_to_chat(self, chat_id: str, card: dict, metadata=None):
-        """Send a secondary interactive card to the chat."""
+    async def _send_card_to_chat(self, chat_id, card, metadata=None):
         try:
             payload = json.dumps(card, ensure_ascii=False)
-            response = await self._feishu_send_with_retry(
+            r = await self._feishu_send_with_retry(
                 chat_id=chat_id, msg_type="interactive", payload=payload,
-                reply_to=None, metadata=metadata,
-            )
-            result = self._finalize_send_result(response, "card send")
-            logger.info("[Feishu] Secondary card sent: %s", result.message_id if result.success else "failed")
+                reply_to=None, metadata=metadata)
+            return self._finalize_send_result(r, "card send")
         except Exception as exc:
-            logger.error("[Feishu] Secondary card send failed: %s", exc)
+            logger.error("[Feishu] Card send failed: %s", exc); return None
 
-
-    def _make_toast(self, content: str) -> Any:
-        """Build a P2CardActionTriggerResponse with a toast."""
-        if P2CardActionTriggerResponse is None or CallBackToast is None:
-            return None
+    def _make_toast(self, content):
+        if P2CardActionTriggerResponse is None or CallBackToast is None: return None
         r = P2CardActionTriggerResponse()
-        t = CallBackToast()
-        t.type = "info"
-        t.content = content
-        r.toast = t
-        return r
+        t = CallBackToast(); t.type = "info"; t.content = content
+        r.toast = t; return r
 
-    def _make_card_response(self, card: dict) -> Any:
-        """Build a P2CardActionTriggerResponse with a replacement card."""
-        if P2CardActionTriggerResponse is None or CallBackCard is None:
-            return None
+    def _make_card_response(self, card):
+        if P2CardActionTriggerResponse is None or CallBackCard is None: return None
         r = P2CardActionTriggerResponse()
-        c = CallBackCard()
-        c.type = "raw"
-        c.data = json.dumps(card, ensure_ascii=False)
-        r.card = c
-        return r
+        c = CallBackCard(); c.type = "raw"; c.data = card
+        r.card = c; return r
 
     def _is_card_action_duplicate(self, token: str) -> bool:
         """Return True if this card action token was already processed within the dedup window."""

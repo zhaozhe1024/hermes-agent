@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Reminder card interaction handler — Calendar GTD / PA integration.
 
-Importable from the hermes-agent root as ``reminder_card_handler``.
-
-Builds interactive cards, persists interaction state, validates clicks,
-atomically transitions state via SQLite CAS, and dispatches PA actions.
+State machine:
+  pending → choosing_extend/choosing_slot → applying → awaiting_confirmation
+  → succeeded/rejected/conflict
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -22,220 +21,169 @@ logger = logging.getLogger(__name__)
 _HERMES_HOME = os.path.expanduser("~/.hermes")
 
 import sys as _sys
-for _p in (
-    os.path.join(_HERMES_HOME, "scripts"),
-    os.path.join(_HERMES_HOME, "hermes-agent"),
-    os.path.join(_HERMES_HOME, "skills/calendar-gtd-integration/scripts"),
-):
-    if _p not in _sys.path:
-        _sys.path.insert(0, _p)
+for _p in (os.path.join(_HERMES_HOME, "scripts"),
+           os.path.join(_HERMES_HOME, "hermes-agent"),
+           os.path.join(_HERMES_HOME, "skills/calendar-gtd-integration/scripts")):
+    if _p not in _sys.path: _sys.path.insert(0, _p)
 
 from safe_runner import pa_snooze as _safe_pa_snooze
 from task_action_handler import (
     show_task, create_session, execute_action, suggest_slots,
-    S_PROPOSED, S_AWAITING,
 )
 from hermes_state import SessionDB
 
-# ── Constants ───────────────────────────────────────────────────────────────
+# ── States ──────────────────────────────────────────────────────────────────
+S_PENDING = "pending"
+S_CHOOSING_EXTEND = "choosing_extend"
+S_CHOOSING_SLOT = "choosing_slot"
+S_APPLYING = "applying"
+S_AWAITING_CONFIRMATION = "awaiting_confirmation"
+S_SUCCEEDED = "succeeded"
+S_REJECTED = "rejected"
+S_CONFLICT = "conflict"
 
 INTERACTION_PREFIX = "pa:interaction:"
 TOKEN_PREFIX = "pa:interaction:token:"
 
-S_PENDING = "pending"
-S_APPLYING = "applying"
-S_SUCCEEDED = "succeeded"
-S_CONFLICT = "conflict"
-S_REJECTED = "rejected"
-
-CARD_ACTIONS = frozenset({"start", "snooze", "reschedule", "complete", "extend"})
-
-
-# ── DB helpers ──────────────────────────────────────────────────────────────
 
 def _get_db() -> SessionDB:
     return SessionDB(Path(os.path.join(_HERMES_HOME, "state.db")))
 
 
-def _iid_key(iid: str) -> str:
-    return f"{INTERACTION_PREFIX}{iid}"
+def _iid_key(iid): return f"{INTERACTION_PREFIX}{iid}"
+def _token_key(tok): return f"{TOKEN_PREFIX}{tok}"
 
 
-def _token_key(token: str) -> str:
-    return f"{TOKEN_PREFIX}{token}"
+# ── Card builders ───────────────────────────────────────────────────────────
 
-
-# ── Card building ───────────────────────────────────────────────────────────
-
-def build_card(
-    interaction_id: str, product_command: str,
-    task_title: str, task_start: Optional[str], task_due: Optional[str],
-    heading: str,
-) -> dict:
-    if product_command == "task.snooze":
-        action_defs = [("现在开始","start","primary"),("重新安排时间","reschedule","default")]
-    elif product_command == "task.start":
-        label = "到 HH:MM 再提醒"
-        if task_start:
-            try:
-                label = f"到 {datetime.fromisoformat(task_start).strftime('%H:%M')} 再提醒"
-            except (ValueError, TypeError): pass
-        action_defs = [("现在开始","start","primary"),(label,"snooze","default"),("重新安排时间","reschedule","default")]
-    elif product_command == "task.completion":
-        action_defs = [("标记完成","complete","primary"),("延长时间","extend","default"),("重新安排时间","reschedule","default")]
+def build_card(iid, pc, title, start, due, heading):
+    if pc == "task.snooze":
+        acts = [("现在开始","start","primary"),("重新安排时间","reschedule","default")]
+    elif pc == "task.start":
+        l = "到 HH:MM 再提醒"
+        if start:
+            try: l = f"到 {datetime.fromisoformat(start).strftime('%H:%M')} 再提醒"
+            except: pass
+        acts = [("现在开始","start","primary"),(l,"snooze","default"),("重新安排时间","reschedule","default")]
+    elif pc == "task.completion":
+        acts = [("标记完成","complete","primary"),("延长时间","extend","default"),("重新安排时间","reschedule","default")]
     else:
-        return {"config":{"wide_screen_mode":True},"header":{"title":{"content":"Error","tag":"plain_text"},"template":"red"},"elements":[{"tag":"markdown","content":"Unknown reminder type."}]}
-
-    time_line = ""
-    if task_start: time_line += f"开始: {task_start}"
-    if task_due: time_line += f"  →  完成: {task_due}"
-
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {"title": {"content": heading, "tag": "plain_text"}, "template": "blue"},
-        "elements": [
-            {"tag": "markdown", "content": f"**{task_title}**\n{time_line}"},
-            {"tag": "action", "actions": [
-                {"tag":"button","text":{"tag":"plain_text","content":l},"type":t,"value":{"hermes_action":"pa_reminder","interaction_id":interaction_id,"action":a}}
-                for l, a, t in action_defs
-            ]},
-        ],
-    }
+        return _error_card("Unknown reminder type.")
+    tl = f"开始: {start}" if start else ""
+    if due: tl += f"  →  完成: {due}"
+    return _mk_card(heading, f"**{title}**\n{tl}", [
+        _btn(l, a, t, iid) for l, a, t in acts
+    ])
 
 
-def build_extend_card(interaction_id: str, task_title: str) -> dict:
-    """Secondary card: extend time options."""
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {"title": {"content": "延长时间", "tag": "plain_text"}, "template": "blue"},
-        "elements": [
-            {"tag": "markdown", "content": f"**{task_title}**\n选择延长时间："},
-            {"tag": "action", "actions": [
-                {"tag":"button","text":{"tag":"plain_text","content":l},"type":t,"value":{"hermes_action":"pa_reminder","interaction_id":interaction_id,"action":"extend_confirm","minutes":m}}
-                for l, m, t in [("+15 分钟",15,"primary"),("+30 分钟",30,"default"),("+60 分钟",60,"default"),("自定义","custom","default")]
-            ]},
-        ],
-    }
+def build_extend_card(iid, title):
+    return _mk_card("延长时间", f"**{title}**\n选择延长时间：", [
+        _btn(f"+{m} 分钟", "extend_confirm", "primary" if m==15 else "default", iid, minutes=m)
+        for m in (15, 30, 60)
+    ] + [_btn("自定义", "extend_custom", "default", iid)])
 
 
-def build_reschedule_card(interaction_id: str, task_title: str, slots: list) -> dict:
-    """Card showing available time slots to pick from."""
-    actions = []
-    for i, s in enumerate(slots[:5]):
-        label = f"{s.get('start','?')} → {s.get('due','?')}"
-        actions.append({"tag":"button","text":{"tag":"plain_text","content":label},"type":"default" if i>0 else "primary",
-            "value":{"hermes_action":"pa_reminder","interaction_id":interaction_id,"action":"reschedule_pick","slot_index":i}})
-    actions.append({"tag":"button","text":{"tag":"plain_text","content":"自定义时间"},"type":"default",
-        "value":{"hermes_action":"pa_reminder","interaction_id":interaction_id,"action":"reschedule_custom"}})
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {"title": {"content": "重新安排时间", "tag": "plain_text"}, "template": "blue"},
-        "elements": [
-            {"tag": "markdown", "content": f"**{task_title}**\n选择新时间："},
-            {"tag": "action", "actions": actions},
-        ],
-    }
+def build_reschedule_card(iid, title, slots):
+    btns = [
+        _btn(f"{s.get('start','?')} → {s.get('due','?')}", "reschedule_pick",
+             "primary" if i==0 else "default", iid, slot_index=i)
+        for i, s in enumerate(slots[:5])
+    ]
+    btns.append(_btn("自定义时间", "reschedule_custom", "default", iid))
+    return _mk_card("重新安排时间", f"**{title}**\n选择新时间：", btns)
 
 
-def build_confirm_card(interaction_id: str, title: str, proposal: dict) -> dict:
-    """Confirmation card with confirm/cancel."""
-    s = proposal.get("start","?"); d = proposal.get("due","?")
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {"title": {"content": "确认操作", "tag": "plain_text"}, "template": "orange"},
-        "elements": [
-            {"tag": "markdown", "content": f"**{title}**\n{s} → {d}\n确认此操作？"},
-            {"tag": "action", "actions": [
-                {"tag":"button","text":{"tag":"plain_text","content":"确认"},"type":"primary",
-                    "value":{"hermes_action":"pa_reminder","interaction_id":interaction_id,"action":"confirm"}},
-                {"tag":"button","text":{"tag":"plain_text","content":"取消"},"type":"danger",
-                    "value":{"hermes_action":"pa_reminder","interaction_id":interaction_id,"action":"cancel"}},
-            ]},
-        ],
-    }
+def build_confirm_card(iid, title, proposal):
+    s, d = proposal.get("start","?"), proposal.get("due","?")
+    return _mk_card("确认操作", f"**{title}**\n{s} → {d}\n确认？", [
+        _btn("确认","confirm","primary",iid),
+        _btn("取消","cancel","danger",iid),
+    ])
 
 
-# ── Interaction persistence ─────────────────────────────────────────────────
+def _mk_card(heading, body, actions):
+    return {"config":{"wide_screen_mode":True},
+            "header":{"title":{"content":heading,"tag":"plain_text"},"template":"orange" if heading=="确认操作" else "blue"},
+            "elements":[{"tag":"markdown","content":body},{"tag":"action","actions":actions}]}
 
-def persist_interaction(
-    interaction_id: str, idempotency_key: str,
-    reminder_id: int, kind: str, product_command: str, expires_at: str,
-    page_id: str, feishu_message_id: str, feishu_chat_id: str,
-    allowed_actions: List[str],
-) -> dict:
-    data = {
-        "interaction_id": interaction_id, "delivery_idempotency_key": idempotency_key,
-        "reminder_id": reminder_id, "kind": kind, "product_command": product_command,
-        "expires_at": expires_at, "page_id": page_id,
-        "feishu_message_id": feishu_message_id, "feishu_chat_id": feishu_chat_id,
-        "allowed_actions": allowed_actions, "state": S_PENDING,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+
+def _btn(label, action, btn_type, iid, **extra):
+    v = {"hermes_action":"pa_reminder","interaction_id":iid,"action":action}
+    v.update(extra)
+    return {"tag":"button","text":{"tag":"plain_text","content":label},"type":btn_type,"value":v}
+
+
+def _error_card(msg):
+    return {"config":{"wide_screen_mode":True},"header":{"title":{"content":"Error","tag":"plain_text"},"template":"red"},
+            "elements":[{"tag":"markdown","content":msg}]}
+
+
+# ── Persistence ─────────────────────────────────────────────────────────────
+
+def persist_interaction(iid, dk, rid, kind, pc, expires, pid, fmid, chat, allowed):
+    data = {"interaction_id":iid,"delivery_idempotency_key":dk,"reminder_id":rid,
+            "kind":kind,"product_command":pc,"expires_at":expires,"page_id":pid,
+            "feishu_message_id":fmid,"feishu_chat_id":chat,"allowed_actions":allowed,
+            "state":S_PENDING,"created_at":datetime.now(timezone.utc).isoformat()}
     db = _get_db()
-    try: db.set_meta(_iid_key(interaction_id), json.dumps(data))
+    try: db.set_meta(_iid_key(iid), json.dumps(data))
     finally:
         try: db.close()
         except: pass
     return data
 
 
-def get_interaction(interaction_id: str) -> Optional[dict]:
+def get_interaction(iid):
     db = _get_db()
     try:
-        raw = db.get_meta(_iid_key(interaction_id))
-        return json.loads(raw) if (raw and raw.strip()) else None
+        r = db.get_meta(_iid_key(iid))
+        return json.loads(r) if (r and r.strip()) else None
     finally:
         try: db.close()
         except: pass
 
 
-def update_interaction(interaction_id: str, updates: dict):
-    data = get_interaction(interaction_id)
-    if not data: return
-    data.update(updates)
+def update_interaction(iid, updates):
+    d = get_interaction(iid)
+    if not d: return
+    d.update(updates)
     db = _get_db()
-    try: db.set_meta(_iid_key(interaction_id), json.dumps(data))
+    try: db.set_meta(_iid_key(iid), json.dumps(d))
     finally:
         try: db.close()
         except: pass
 
 
-# ── Atomic CAS + token ──────────────────────────────────────────────────────
+# ── Atomic CAS ──────────────────────────────────────────────────────────────
 
-def atomic_claim(interaction_id: str, token: str) -> Optional[str]:
-    """Atomic: CAS pending→applying + INSERT token. Returns None=OK or error."""
+def atomic_claim(iid: str, token: str, expected_state: str) -> Optional[str]:
+    """Atomically: CAS state → applying + INSERT token. Returns None=OK or error."""
     db = _get_db()
     try:
         conn = db._conn
-        with conn:
-            # 1. CAS: only allow pending
-            row = conn.execute(
-                "SELECT value FROM state_meta WHERE key=?", (_iid_key(interaction_id),)
-            ).fetchone()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (_iid_key(iid),)).fetchone()
             if not row or not row[0]:
-                return "interaction not found"
+                conn.rollback(); return "interaction not found"
             data = json.loads(row[0] if isinstance(row, dict) else row[0])
-            if data.get("state") != S_PENDING:
-                return f"state not pending ({data.get('state')})"
+            if data.get("state") != expected_state:
+                conn.rollback(); return f"state not {expected_state} ({data.get('state')})"
 
-            # 2. INSERT OR IGNORE token
+            data["state"] = S_APPLYING if expected_state not in (S_AWAITING_CONFIRMATION, S_CHOOSING_EXTEND, S_CHOOSING_SLOT) else S_APPLYING
             conn.execute(
-                "INSERT OR IGNORE INTO state_meta (key, value) VALUES(?,?)",
-                (_token_key(token), "1"),
-            )
-            if conn.total_changes == 0:
-                return "duplicate token"
+                "INSERT INTO state_meta (key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (_iid_key(iid), json.dumps(data)))
 
-            # 3. Update state to applying
-            data["state"] = S_APPLYING
-            conn.execute(
-                "INSERT INTO state_meta (key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (_iid_key(interaction_id), json.dumps(data)),
-            )
-        return None  # success
+            conn.execute("INSERT OR IGNORE INTO state_meta (key,value) VALUES(?,?)", (_token_key(token), "1"))
+            if conn.execute("SELECT changes()").fetchone()[0] == 0:
+                conn.rollback(); return "duplicate token"
+
+            conn.commit(); return None
+        except Exception:
+            conn.rollback(); raise
     except Exception as exc:
-        logger.error("atomic_claim failed: %s", exc)
-        return str(exc)
+        logger.error("atomic_claim: %s", exc); return str(exc)
     finally:
         try: db.close()
         except: pass
@@ -243,166 +191,167 @@ def atomic_claim(interaction_id: str, token: str) -> Optional[str]:
 
 # ── Validation ──────────────────────────────────────────────────────────────
 
-def validate_click(
-    interaction_id: str, operator_open_id: str, open_chat_id: str,
-    open_message_id: str, action: str, event_token: str,
-) -> Optional[str]:
-    data = get_interaction(interaction_id)
-    if not data: return "interaction not found"
-    if data.get("state") not in (S_PENDING, S_APPLYING):
-        return f"interaction closed (state={data['state']})"
-    if data.get("feishu_message_id") != open_message_id: return "message_id mismatch"
-    configured_chat = os.environ.get("FEISHU_FRANK_CHAT_ID","").strip()
-    if not configured_chat or open_chat_id != configured_chat: return "chat mismatch"
-    allowed = os.environ.get("FEISHU_ALLOWED_USERS","").strip()
-    if not allowed or operator_open_id not in {u.strip() for u in allowed.split(",") if u.strip()}:
-        return "user not authorized"
-    if action not in data.get("allowed_actions",[]) and action not in (
-        "extend_confirm","reschedule_pick","reschedule_custom","confirm","cancel"):
+def validate_click(iid, oid, chat, mid, action, token):
+    d = get_interaction(iid)
+    if not d: return "interaction not found"
+    if d.get("state") not in (S_PENDING, S_CHOOSING_EXTEND, S_CHOOSING_SLOT, S_APPLYING, S_AWAITING_CONFIRMATION):
+        return f"closed ({d['state']})"
+    if d.get("feishu_message_id") != mid: return "message_id mismatch"
+    cc = os.environ.get("FEISHU_FRANK_CHAT_ID","").strip()
+    if not cc or chat != cc: return "chat mismatch"
+    au = os.environ.get("FEISHU_ALLOWED_USERS","").strip()
+    if not au or oid not in {u.strip() for u in au.split(",") if u.strip()}: return "user not authorized"
+    # Action allowlist check
+    _ALLOWED_ALL = frozenset({
+        "start","snooze","reschedule","complete","extend",
+        "extend_confirm","extend_custom","reschedule_pick","reschedule_custom",
+        "confirm","cancel",
+    })
+    if action not in _ALLOWED_ALL:
         return f"action not allowed: {action}"
-    expires_str = data.get("expires_at")
-    if expires_str:
+    if action not in d.get("allowed_actions",[]) and action not in (
+        "extend_confirm","extend_custom","reschedule_pick","reschedule_custom","confirm","cancel"):
+        return f"action not allowed for this interaction: {action}"
+    ex = d.get("expires_at")
+    if ex:
         try:
-            if datetime.now(timezone.utc) > datetime.fromisoformat(expires_str):
-                return "interaction expired"
-        except ValueError: return "unparseable expiry"
+            if datetime.now(timezone.utc) > datetime.fromisoformat(ex): return "expired"
+        except: return "unparseable expiry"
     return None
 
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
 
-def dispatch_action(interaction_id: str, action: str, event_token: str) -> str:
-    """Validated dispatch. Returns state string for adapter."""
-    # Atomic CAS — must succeed before any action
-    err = atomic_claim(interaction_id, event_token)
-    if err:
-        return err  # "duplicate token" or "state not pending" etc.
+def dispatch_action(iid: str, action: str, token: str, params: dict = None) -> str:
+    """Dispatch a card action. Returns state string."""
+    params = params or {}
+    d = get_interaction(iid)
+    if not d: return "interaction_not_found"
 
-    data = get_interaction(interaction_id)
-    if not data:
-        update_interaction(interaction_id, {"state": S_CONFLICT})
-        return "interaction_not_found"
-
-    page_id = data.get("page_id","")
-    result = "failed"
-
-    try:
-        if action == "snooze":
-            result = _do_snooze(data)
-        elif action in ("start","complete"):
-            result = _do_task_action(data, action)
-        elif action == "extend":
-            result = "extend_card"  # needs secondary card
-        elif action == "extend_confirm":
-            result = _do_extend_confirm(data, event_token)
-        elif action == "reschedule":
-            result = "reschedule_card"  # needs slots card
-        elif action == "reschedule_pick":
-            result = _do_reschedule_pick(data, event_token)
-        elif action == "reschedule_custom":
-            result = "reschedule_custom"
-        elif action == "confirm":
-            result = _do_confirm(data)
-        elif action == "cancel":
-            update_interaction(interaction_id, {"state": S_REJECTED})
-            result = "cancelled"
+    # ── Secondary card responses (no CAS needed) ──
+    if action in ("extend","reschedule"):
+        err = atomic_claim(iid, token, S_PENDING)
+        if err: return err
+        if action == "extend":
+            update_interaction(iid, {"state": S_CHOOSING_EXTEND})
+            return "extend_card"
         else:
-            result = "unknown_action"
-    except Exception as exc:
-        logger.error("dispatch %s failed: %s", action, exc)
-        result = "failed"
+            slots_r = suggest_slots(d["page_id"])
+            if not slots_r.get("success") or not slots_r.get("slots"):
+                update_interaction(iid, {"state": S_CONFLICT})
+                return "no_slots"
+            update_interaction(iid, {"state": S_CHOOSING_SLOT, "slot_candidates": slots_r["slots"]})
+            return "reschedule_card"
 
-    # Final state
-    if result in ("succeeded","applied","cancelled"):
-        update_interaction(interaction_id, {"state": S_SUCCEEDED if result=="succeeded" else
-            (S_REJECTED if result=="cancelled" else S_SUCCEEDED),
-            "result": result, "dispatched_action": action})
-    elif result in ("extend_card","reschedule_card","reschedule_custom","confirmation_required"):
-        pass  # state stays applying, secondary card needed
-    else:
-        update_interaction(interaction_id, {"state": S_CONFLICT, "result": result})
-    return result
+    # ── Choosing confirmations ──
+    if action == "extend_confirm":
+        err = atomic_claim(iid, token, S_CHOOSING_EXTEND)
+        if err: return err
+        minutes = params.get("minutes", 30)
+        return _do_extend(d, minutes)
+
+    if action == "extend_custom":
+        err = atomic_claim(iid, token, S_CHOOSING_EXTEND)
+        if err: return err
+        update_interaction(iid, {"state": S_APPLYING})
+        return "custom_extend"
+
+    if action == "reschedule_pick":
+        err = atomic_claim(iid, token, S_CHOOSING_SLOT)
+        if err: return err
+        idx = params.get("slot_index", 0)
+        slots = d.get("slot_candidates", [])
+        if idx >= len(slots):
+            update_interaction(iid, {"state": S_CONFLICT})
+            return "invalid_slot_index"
+        return _do_reschedule(d, slots[idx])
+
+    if action == "reschedule_custom":
+        err = atomic_claim(iid, token, S_CHOOSING_SLOT)
+        if err: return err
+        update_interaction(iid, {"state": S_APPLYING})
+        return "custom_reschedule"
+
+    # ── Direct actions ──
+    if action in ("start","complete"):
+        err = atomic_claim(iid, token, S_PENDING)
+        if err: return err
+        return _do_task_action(d, action)
+
+    if action == "snooze":
+        err = atomic_claim(iid, token, S_PENDING)
+        if err: return err
+        r = _safe_pa_snooze(d["reminder_id"], d["page_id"], d["feishu_message_id"], d["delivery_idempotency_key"])
+        update_interaction(iid, {"state": S_SUCCEEDED if r.ok else S_CONFLICT, "result": "snoozed"})
+        return "succeeded" if r.ok else "failed"
+
+    # ── Confirmation flow ──
+    if action == "confirm":
+        err = atomic_claim(iid, token, S_AWAITING_CONFIRMATION)
+        if err: return err
+        sid = d.get("session_id","")
+        uid = os.environ.get("FEISHU_ALLOWED_USERS","").split(",")[0].strip()
+        exe = execute_action(sid, feishu_chat_id=d["feishu_chat_id"], feishu_user_id=uid,
+                             confirmation_token=d.get("confirmation_token",""))
+        update_interaction(iid, {"state": S_SUCCEEDED if exe.get("success") else S_CONFLICT, "result": "confirmed"})
+        return "succeeded" if exe.get("success") else "failed"
+
+    if action == "cancel":
+        err = atomic_claim(iid, token, S_AWAITING_CONFIRMATION)
+        if err: return err
+        update_interaction(iid, {"state": S_REJECTED, "result": "cancelled"})
+        return "cancelled"
+
+    return "unknown_action"
 
 
-def _do_snooze(data: dict) -> str:
-    r = _safe_pa_snooze(data["reminder_id"], data["page_id"],
-                        data["feishu_message_id"], data["delivery_idempotency_key"])
-    return "succeeded" if r.ok else "failed"
+def _do_extend(d, minutes):
+    shown = show_task(d["page_id"])
+    if not shown.get("success"):
+        update_interaction(d["interaction_id"], {"state": S_CONFLICT}); return "failed"
+    old_due = shown.get("due")
+    new_due = old_due
+    if old_due and minutes != "custom":
+        try:
+            dt = datetime.fromisoformat(old_due) + timedelta(minutes=minutes)
+            new_due = dt.isoformat()
+        except: pass
+    return _create_and_execute(d, "extend", due=new_due)
 
 
-def _do_task_action(data: dict, action: str) -> str:
-    shown = show_task(data["page_id"])
-    if not shown.get("success"): return "failed"
+def _do_reschedule(d, slot):
+    shown = show_task(d["page_id"])
+    if not shown.get("success"):
+        update_interaction(d["interaction_id"], {"state": S_CONFLICT}); return "failed"
+    return _create_and_execute(d, "reschedule", start=slot.get("start"), due=slot.get("due"))
+
+
+def _do_task_action(d, action):
+    shown = show_task(d["page_id"])
+    if not shown.get("success"):
+        update_interaction(d["interaction_id"], {"state": S_CONFLICT}); return "failed"
+    return _create_and_execute(d, action)
+
+
+def _create_and_execute(d, action, start=None, due=None):
     sid = f"card-{uuid.uuid4().hex[:12]}"
     uid = os.environ.get("FEISHU_ALLOWED_USERS","").split(",")[0].strip()
-    r = create_session(sid, data["feishu_chat_id"], uid,
-                       data["feishu_message_id"], data["page_id"], action)
-    if not r.get("success"): return "failed"
-    exe = execute_action(sid, feishu_chat_id=data["feishu_chat_id"], feishu_user_id=uid)
-    return "succeeded" if exe.get("success") else "failed"
+    r = create_session(sid, d["feishu_chat_id"], uid, d["feishu_message_id"],
+                       d["page_id"], action, start=start, due=due)
+    if not r.get("success"):
+        update_interaction(d["interaction_id"], {"state": S_CONFLICT}); return "failed"
 
-
-def _do_extend_confirm(data: dict, token: str) -> str:
-    """User picked extend minutes → create session with computed due."""
-    import json as _j
-    # The token value from the extend card button contains minutes
-    # For now, use a default +30min; the actual minutes would come from button value
-    shown = show_task(data["page_id"])
-    if not shown.get("success"): return "failed"
-    due = shown.get("due")
-    if due:
-        try:
-            dt = datetime.fromisoformat(due) + __import__("datetime").timedelta(minutes=30)
-            due = dt.isoformat()
-        except (ValueError, TypeError): pass
-    sid = f"card-ext-{uuid.uuid4().hex[:12]}"
-    uid = os.environ.get("FEISHU_ALLOWED_USERS","").split(",")[0].strip()
-    r = create_session(sid, data["feishu_chat_id"], uid,
-                       data["feishu_message_id"], data["page_id"], "extend", due=due)
-    if not r.get("success"): return "failed"
-    exe = execute_action(sid, feishu_chat_id=data["feishu_chat_id"], feishu_user_id=uid)
+    exe = execute_action(sid, feishu_chat_id=d["feishu_chat_id"], feishu_user_id=uid)
     if exe.get("status") == "confirmation_required":
-        # Save confirmation token in interaction
-        update_interaction(data["interaction_id"], {
-            "session_id": sid,
+        update_interaction(d["interaction_id"], {
+            "state": S_AWAITING_CONFIRMATION, "session_id": sid,
             "proposal": exe.get("proposal",{}),
             "confirmation_token": exe.get("confirmation_token",""),
-            "confirmation_expires_at": "",  # parsed from exe
+            "confirmation_expires_at": exe.get("confirmation_expires_at",""),
         })
         return "confirmation_required"
-    return "succeeded" if exe.get("success") else "failed"
-
-
-def _do_reschedule_pick(data: dict, token: str) -> str:
-    """User picked a slot → create reschedule session."""
-    slots_r = suggest_slots(data["page_id"])
-    if not slots_r.get("success") or not slots_r.get("slots"): return "failed"
-    # Get the slot index from interaction data (set by adapter before dispatch)
-    slot_idx = int(data.get("slot_index", 0))
-    slot = slots_r["slots"][min(slot_idx, len(slots_r["slots"])-1)]
-    shown = show_task(data["page_id"])
-    if not shown.get("success"): return "failed"
-    sid = f"card-res-{uuid.uuid4().hex[:12]}"
-    uid = os.environ.get("FEISHU_ALLOWED_USERS","").split(",")[0].strip()
-    r = create_session(sid, data["feishu_chat_id"], uid,
-                       data["feishu_message_id"], data["page_id"], "reschedule",
-                       start=slot.get("start"), due=slot.get("due"))
-    if not r.get("success"): return "failed"
-    exe = execute_action(sid, feishu_chat_id=data["feishu_chat_id"], feishu_user_id=uid)
-    if exe.get("status") == "confirmation_required":
-        update_interaction(data["interaction_id"], {
-            "session_id": sid, "proposal": exe.get("proposal",{}),
-            "confirmation_token": exe.get("confirmation_token",""),
-        })
-        return "confirmation_required"
-    return "succeeded" if exe.get("success") else "failed"
-
-
-def _do_confirm(data: dict) -> str:
-    """User confirmed a pending proposal."""
-    sid = data.get("session_id","")
-    uid = os.environ.get("FEISHU_ALLOWED_USERS","").split(",")[0].strip()
-    exe = execute_action(sid, feishu_chat_id=data["feishu_chat_id"],
-                         feishu_user_id=uid,
-                         confirmation_token=data.get("confirmation_token",""))
-    return "succeeded" if exe.get("success") else "failed"
+    if exe.get("success"):
+        update_interaction(d["interaction_id"], {"state": S_SUCCEEDED, "result": "applied"})
+        return "succeeded"
+    update_interaction(d["interaction_id"], {"state": S_CONFLICT})
+    return "failed"
