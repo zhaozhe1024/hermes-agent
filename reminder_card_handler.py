@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Reminder card interaction handler — Calendar GTD / PA integration.
 
-Keyword calls from worker: build_card(interaction_id=...,product_command=...,task_title=...,...),
-persist_interaction(interaction_id=...,idempotency_key=...,...).
-
 State: pending→choosing_*→applying→awaiting_confirmation→succeeded/rejected/conflict.
+Delivery failure: choosing_*→delivery_failed (recoverable via retry_delivery).
 """
 
 from __future__ import annotations
@@ -23,6 +21,7 @@ from safe_runner import pa_snooze as _safe_pa_snooze
 from task_action_handler import show_task, create_session, execute_action, suggest_slots, get_session
 from hermes_state import SessionDB
 
+# States
 S_PENDING,S_CHOOSING_EXTEND,S_CHOOSING_SLOT,S_APPLYING="pending","choosing_extend","choosing_slot","applying"
 S_AWAITING_CONFIRMATION,S_SUCCEEDED,S_REJECTED,S_CONFLICT="awaiting_confirmation","succeeded","rejected","conflict"
 S_DELIVERY_FAILED="delivery_failed"
@@ -33,18 +32,14 @@ def _tk(tok): return f"{TP}{tok}"
 
 # ── Cards ──
 def build_card(interaction_id=None, product_command=None, task_title=None,
-               task_start=None, task_due=None, heading=None,
-               # Positional compat for tests: (iid, pc, title, ts, td, h)
-               *args):
-    """Build reminder card. Accepts positional or keyword args."""
+               task_start=None, task_due=None, heading=None, *args):
     if args or interaction_id is None:
-        if len(args) >= 3: interaction_id,product_command,task_title = args[0],args[1],args[2]
-        if len(args) >= 4: task_start = args[3]
-        if len(args) >= 5: task_due = args[4]
-        if len(args) >= 6: heading = args[5]
-    pc = product_command
-    if not heading:
-        heading = {"task.start":"即将开始","task.completion":"到时确认","task.snooze":"到点提醒"}.get(pc,"任务提醒")
+        if len(args)>=3: interaction_id,product_command,task_title=args[0],args[1],args[2]
+        if len(args)>=4: task_start=args[3]
+        if len(args)>=5: task_due=args[4]
+        if len(args)>=6: heading=args[5]
+    pc=product_command
+    if not heading: heading={"task.start":"即将开始","task.completion":"到时确认","task.snooze":"到点提醒"}.get(pc,"任务提醒")
     if pc=="task.snooze": acts=[("现在开始","start","primary"),("重新安排时间","reschedule","default")]
     elif pc=="task.start":
         l="到 HH:MM 再提醒"
@@ -64,8 +59,14 @@ def build_reschedule_card(iid,title,slots):
     btns=[_btn(f"{s.get('start','?')} → {s.get('due','?')}","reschedule_pick","primary" if i==0 else "default",iid,slot_index=i) for i,s in enumerate(slots[:5])]
     btns.append(_btn("自定义时间","reschedule_custom","default",iid,task_title=title))
     return _card("重新安排时间",f"**{title}**\n选择新时间：",btns)
-def build_custom_time_card(iid,title): return _card("自定义时间",f"**{title}**\n输入 'HH:MM' 或 '明天 HH:MM'",
-    [_btn("取消","cancel","danger",iid)])
+def build_custom_date_card(iid,title):
+    """Date picker card with today..+6d and cancel."""
+    today=datetime.now().date()
+    btns=[_btn(f"{today+timedelta(days=d)}（{'今天' if d==0 else '明天' if d==1 else str(d)+'天后'}）",
+               "reschedule_custom_submit","primary" if d==0 else "default",iid,
+               custom_date=f"{today+timedelta(days=d)}") for d in range(7)]
+    btns.append(_btn("取消","cancel","danger",iid))
+    return _card("自定义时间",f"**{title}**\n选择日期：",btns)
 def build_confirm_card(iid,title,proposal):
     s,d=proposal.get("start","?"),proposal.get("due","?")
     return _card("确认操作",f"**{title}**\n{s} → {d}\n确认？",[_btn("确认","confirm","primary",iid),_btn("取消","cancel","danger",iid)])
@@ -78,19 +79,19 @@ def persist_interaction(interaction_id=None, idempotency_key=None, reminder_id=N
                         kind=None, product_command=None, expires_at=None, page_id=None,
                         feishu_message_id=None, feishu_chat_id=None, allowed_actions=None,
                         task_title=None, *args):
-    """Persist interaction. Accepts positional or keyword args."""
     if args or interaction_id is None:
-        n=["interaction_id","idempotency_key","reminder_id","kind","product_command",
-           "expires_at","page_id","feishu_message_id","feishu_chat_id","allowed_actions"]
         vals = [interaction_id,idempotency_key,reminder_id,kind,product_command,
                 expires_at,page_id,feishu_message_id,feishu_chat_id,allowed_actions]
         if args: vals = list(args)
-        for i,v in enumerate(vals):
-            if i<len(n) and v is not None: locals()[n[i]] = v
-        interaction_id,idempotency_key,reminder_id=vals[0] if len(vals)>0 else interaction_id, vals[1] if len(vals)>1 else idempotency_key, vals[2] if len(vals)>2 else reminder_id
-        kind,product_command=vals[3] if len(vals)>3 else kind, vals[4] if len(vals)>4 else product_command
-        expires_at,page_id=vals[5] if len(vals)>5 else expires_at, vals[6] if len(vals)>6 else page_id
-        feishu_message_id,feishu_chat_id=vals[7] if len(vals)>7 else feishu_message_id, vals[8] if len(vals)>8 else feishu_chat_id
+        interaction_id=vals[0] if len(vals)>0 else interaction_id
+        idempotency_key=vals[1] if len(vals)>1 else idempotency_key
+        reminder_id=vals[2] if len(vals)>2 else reminder_id
+        kind=vals[3] if len(vals)>3 else kind
+        product_command=vals[4] if len(vals)>4 else product_command
+        expires_at=vals[5] if len(vals)>5 else expires_at
+        page_id=vals[6] if len(vals)>6 else page_id
+        feishu_message_id=vals[7] if len(vals)>7 else feishu_message_id
+        feishu_chat_id=vals[8] if len(vals)>8 else feishu_chat_id
         allowed_actions=vals[9] if len(vals)>9 else allowed_actions
     data={"interaction_id":interaction_id,"delivery_idempotency_key":idempotency_key,
           "reminder_id":reminder_id,"kind":kind,"product_command":product_command,
@@ -141,18 +142,24 @@ def atomic_claim(iid,token,expected_state):
         except: pass
 
 # ── Validation ──
+_ALL_ACTIONS=frozenset({"start","snooze","reschedule","complete","extend",
+    "extend_confirm","reschedule_pick","reschedule_custom","reschedule_custom_submit",
+    "confirm","cancel"})
+_SECONDARY_ACTIONS=frozenset({"extend_confirm","reschedule_pick","reschedule_custom",
+    "reschedule_custom_submit","confirm","cancel"})
+
 def validate_click(iid,oid,chat,mid,action,token):
     d=get_interaction(iid)
     if not d: return "not found"
-    if d.get("state") not in (S_PENDING,S_CHOOSING_EXTEND,S_CHOOSING_SLOT,S_APPLYING,S_AWAITING_CONFIRMATION): return f"closed ({d['state']})"
+    if d.get("state") not in (S_PENDING,S_CHOOSING_EXTEND,S_CHOOSING_SLOT,S_APPLYING,S_AWAITING_CONFIRMATION,S_DELIVERY_FAILED):
+        return f"closed ({d['state']})"
     if d.get("active_message_id")!=mid: return "message_id mismatch"
     cc=os.environ.get("FEISHU_FRANK_CHAT_ID","").strip()
     if not cc or chat!=cc: return "chat mismatch"
     au=os.environ.get("FEISHU_ALLOWED_USERS","").strip()
     if not au or oid not in {u.strip() for u in au.split(",") if u.strip()}: return "user not authorized"
-    _A=frozenset({"start","snooze","reschedule","complete","extend","extend_confirm","reschedule_pick","reschedule_custom","confirm","cancel"})
-    if action not in _A: return f"action not allowed: {action}"
-    if action not in d.get("allowed_actions",[]) and action not in ("extend_confirm","reschedule_pick","reschedule_custom","confirm","cancel"):
+    if action not in _ALL_ACTIONS: return f"action not allowed: {action}"
+    if action not in d.get("allowed_actions",[]) and action not in _SECONDARY_ACTIONS:
         return f"action not allowed for this interaction: {action}"
     ex=d.get("expires_at")
     if ex:
@@ -165,6 +172,7 @@ def validate_click(iid,oid,chat,mid,action,token):
 def dispatch_action(iid,action,token,params=None):
     params=params or {}; d=get_interaction(iid)
     if not d: return {"status":"interaction_not_found"}
+
     if action in ("extend","reschedule"):
         err=atomic_claim(iid,token,S_PENDING)
         if err: return {"status":err}
@@ -176,30 +184,56 @@ def dispatch_action(iid,action,token,params=None):
             if not sr.get("success") or not sr.get("slots"): update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_slots"}
             update_interaction(iid,{"state":S_CHOOSING_SLOT,"slot_candidates":sr["slots"]})
             return {"status":"choose_slot","next_state":S_CHOOSING_SLOT,"card":build_reschedule_card(iid,d.get("task_title",d["page_id"]),sr["slots"])}
+
     if action=="extend_confirm":
         err=atomic_claim(iid,token,S_CHOOSING_EXTEND)
         if err: return {"status":err}
         return _do_extend(d,params.get("minutes",30))
+
     if action=="reschedule_pick":
         err=atomic_claim(iid,token,S_CHOOSING_SLOT)
         if err: return {"status":err}
         sl=d.get("slot_candidates",[]); idx=params.get("slot_index",0)
         if idx>=len(sl): update_interaction(iid,{"state":S_CONFLICT}); return {"status":"invalid_slot_index"}
         return _do_reschedule(d,sl[idx])
+
     if action=="reschedule_custom":
         err=atomic_claim(iid,token,S_CHOOSING_SLOT)
         if err: return {"status":err}
-        return {"status":"custom_time","card":build_custom_time_card(iid,d.get("task_title",d["page_id"]))}
+        return {"status":"custom_date","card":build_custom_date_card(iid,d.get("task_title",d["page_id"]))}
+
+    if action=="reschedule_custom_submit":
+        err=atomic_claim(iid,token,S_CHOOSING_SLOT)
+        if err: return {"status":err}
+        custom_date=params.get("custom_date","")
+        if not custom_date:
+            update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_date"}
+        # Call suggest_slots with custom date range
+        sr=suggest_slots(d["page_id"],start=f"{custom_date}T00:00:00+08:00",due=f"{custom_date}T23:59:59+08:00")
+        if sr.get("success") and sr.get("slots"):
+            update_interaction(iid,{"slot_candidates":sr["slots"]})
+            return {"status":"choose_slot","card":build_reschedule_card(iid,d.get("task_title",d["page_id"]),sr["slots"])}
+        # No slots for custom date — show week alternatives
+        week_start=(datetime.fromisoformat(custom_date)-timedelta(days=datetime.fromisoformat(custom_date).weekday())).strftime("%Y-%m-%d")
+        week_end=(datetime.fromisoformat(custom_date)+timedelta(days=6-datetime.fromisoformat(custom_date).weekday())).strftime("%Y-%m-%d")
+        wr=suggest_slots(d["page_id"],start=f"{week_start}T00:00:00+08:00",due=f"{week_end}T23:59:59+08:00")
+        if wr.get("success") and wr.get("slots"):
+            update_interaction(iid,{"slot_candidates":wr["slots"]})
+            return {"status":"choose_slot_week","card":build_reschedule_card(iid,d.get("task_title",d["page_id"]),wr["slots"])}
+        update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_slots"}
+
     if action in ("start","complete"):
         err=atomic_claim(iid,token,S_PENDING)
         if err: return {"status":err}
         return _do_task(d,action)
+
     if action=="snooze":
         err=atomic_claim(iid,token,S_PENDING)
         if err: return {"status":err}
         r=_safe_pa_snooze(d["reminder_id"],d["page_id"],d["active_message_id"],d["delivery_idempotency_key"])
         update_interaction(iid,{"state":S_SUCCEEDED if r.ok else S_CONFLICT})
         return {"status":"succeeded" if r.ok else "failed"}
+
     if action=="confirm":
         err=atomic_claim(iid,token,S_AWAITING_CONFIRMATION)
         if err: return {"status":err}
@@ -207,11 +241,13 @@ def dispatch_action(iid,action,token,params=None):
         exe=execute_action(d["session_id"],feishu_chat_id=d["feishu_chat_id"],feishu_user_id=uid,confirmation_token=d["confirmation_token"])
         update_interaction(iid,{"state":S_SUCCEEDED if exe.get("success") else S_CONFLICT})
         return {"status":"succeeded" if exe.get("success") else "failed"}
+
     if action=="cancel":
         err=atomic_claim(iid,token,S_AWAITING_CONFIRMATION)
         if err: return {"status":err}
         update_interaction(iid,{"state":S_REJECTED,"result":"cancelled"})
         return {"status":"cancelled"}
+
     return {"status":"unknown_action"}
 
 def _do_extend(d,mins):
@@ -222,14 +258,8 @@ def _do_extend(d,mins):
         try: new=(datetime.fromisoformat(old)+timedelta(minutes=mins)).isoformat()
         except: pass
     return _cx(d,"extend",due=new)
-def _do_reschedule(d,slot):
-    s=show_task(d["page_id"])
-    if not s.get("success"): update_interaction(d["interaction_id"],{"state":S_CONFLICT}); return {"status":"failed"}
-    return _cx(d,"reschedule",start=slot.get("start"),due=slot.get("due"))
-def _do_task(d,action):
-    s=show_task(d["page_id"])
-    if not s.get("success"): update_interaction(d["interaction_id"],{"state":S_CONFLICT}); return {"status":"failed"}
-    return _cx(d,action)
+def _do_reschedule(d,slot): s=show_task(d["page_id"]); return _cx(d,"reschedule",start=slot.get("start"),due=slot.get("due")) if s.get("success") else (update_interaction(d["interaction_id"],{"state":S_CONFLICT}) or {"status":"failed"})
+def _do_task(d,action): s=show_task(d["page_id"]); return _cx(d,action) if s.get("success") else (update_interaction(d["interaction_id"],{"state":S_CONFLICT}) or {"status":"failed"})
 def _cx(d,action,start=None,due=None):
     sid=f"card-{uuid.uuid4().hex[:12]}"
     uid=os.environ.get("FEISHU_ALLOWED_USERS","").split(",")[0].strip()
@@ -237,8 +267,7 @@ def _cx(d,action,start=None,due=None):
     if not r.get("success"): update_interaction(d["interaction_id"],{"state":S_CONFLICT}); return {"status":"failed"}
     exe=execute_action(sid,feishu_chat_id=d["feishu_chat_id"],feishu_user_id=uid)
     if exe.get("status")=="confirmation_required":
-        sess=get_session(sid)
-        ctok=(sess or {}).get("confirmation_token",""); cexp=(sess or {}).get("confirmation_expires_at","")
+        sess=get_session(sid); ctok=(sess or {}).get("confirmation_token",""); cexp=(sess or {}).get("confirmation_expires_at","")
         prop=exe.get("proposal",sess.get("proposal",{}) if sess else {})
         update_interaction(d["interaction_id"],{"state":S_AWAITING_CONFIRMATION,"session_id":sid,"proposal":prop,"confirmation_token":ctok,"confirmation_expires_at":cexp})
         return {"status":"confirmation_required","card":build_confirm_card(d["interaction_id"],d.get("task_title",d["page_id"]),prop)}
@@ -254,3 +283,22 @@ def mark_delivery_failed(iid):
         db=_db()
         try: db.set_meta(_ik(iid),json.dumps(d))
         finally: db.close()
+
+def retry_delivery(iid):
+    """Recover from delivery_failed: rebuild card from saved interaction data."""
+    d=get_interaction(iid)
+    if not d or d.get("state")!=S_DELIVERY_FAILED: return None
+    prev_state="pending"
+    card=None
+    if "slot_candidates" in d:
+        card=build_reschedule_card(iid,d.get("task_title",d["page_id"]),d["slot_candidates"])
+        prev_state=S_CHOOSING_SLOT
+    elif d.get("proposal"):
+        card=build_confirm_card(iid,d.get("task_title",d["page_id"]),d["proposal"])
+        prev_state=S_AWAITING_CONFIRMATION
+    else:
+        card=build_extend_card(iid,d.get("task_title",d["page_id"]))
+        prev_state=S_CHOOSING_EXTEND
+    # Restore to previous state so card can be used again
+    update_interaction(iid,{"state":prev_state})
+    return {"card":card,"chat_id":d["feishu_chat_id"],"state":prev_state}

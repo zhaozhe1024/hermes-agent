@@ -3052,6 +3052,9 @@ class FeishuAdapter(BasePlatformAdapter):
                                   idempotency_uuid=None, reply_to=None, metadata=None):
         try:
             payload = json.dumps(card, ensure_ascii=False)
+            if idempotency_uuid:
+                metadata = (metadata or {})
+                metadata = {**metadata, "idempotency_uuid": idempotency_uuid}
             r = await self._feishu_send_with_retry(
                 chat_id=chat_id, msg_type="interactive", payload=payload,
                 reply_to=reply_to, metadata=metadata)
