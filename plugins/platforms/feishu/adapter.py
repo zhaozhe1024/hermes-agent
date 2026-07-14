@@ -3014,7 +3014,7 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _dispatch_pa_reminder_action(
         self, *, iid: str, action: str, etok: str, params: dict
     ) -> None:
-        from reminder_card_handler import dispatch_action, get_interaction, update_interaction, mark_delivery_failed
+        from reminder_card_handler import dispatch_action, get_interaction, update_interaction
 
         try:
             result = dispatch_action(iid, action, etok, params)
@@ -3025,7 +3025,6 @@ class FeishuAdapter(BasePlatformAdapter):
             if card:
                 data = get_interaction(iid)
                 if data:
-                    # Use deterministic UUID for idempotent retries
                     iuuid = self._derive_card_uuid(iid, status)
                     sr = await self._send_card_to_chat(
                         chat_id=data["feishu_chat_id"], card=card,
@@ -3034,13 +3033,9 @@ class FeishuAdapter(BasePlatformAdapter):
                     if sr and sr.success:
                         update_interaction(iid, {"active_message_id": sr.message_id})
                     else:
-                        logger.error("[Feishu] Card delivery failed for %s, marking recoverable", iid)
-                        mark_delivery_failed(iid)
+                        logger.error("[Feishu] Card delivery failed for %s", iid)
         except Exception as exc:
             logger.error("[Feishu] PA dispatch failed: %s", exc, exc_info=True)
-            from reminder_card_handler import mark_delivery_failed
-            try: mark_delivery_failed(iid)
-            except: pass
 
     @staticmethod
     def _derive_card_uuid(iid: str, context: str) -> str:

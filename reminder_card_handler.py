@@ -62,10 +62,21 @@ def build_reschedule_card(iid,title,slots):
 def build_custom_date_card(iid,title):
     today=datetime.now().date()
     btns=[_btn(f"{today+timedelta(days=d)}（{'今天' if d==0 else '明天' if d==1 else str(d)+'天后'}）",
-               "reschedule_custom_submit","primary" if d==0 else "default",iid,
+               "reschedule_custom_pick_date","primary" if d==0 else "default",iid,
                custom_date=f"{today+timedelta(days=d)}") for d in range(7)]
     btns.append(_btn("返回推荐时间","reschedule_cancel","danger",iid))
-    return _card("自定义时间",f"**{title}**\n选择日期：",btns)
+    return _card("选择日期",f"**{title}**\n选择日期：",btns)
+
+def build_custom_time_card(iid, title, custom_date):
+    """Time picker: common slots on the chosen date."""
+    btns=[]
+    for h in range(8,18):
+        s=f"{custom_date}T{h:02d}:00:00+08:00"
+        e=f"{custom_date}T{h+1:02d}:00:00+08:00"
+        btns.append(_btn(f"{h:02d}:00 - {h+1:02d}:00","reschedule_custom_submit","primary" if h==8 else "default",iid,
+                          custom_date=custom_date,custom_start=s,custom_due=e))
+    btns.append(_btn("返回推荐时间","reschedule_cancel","danger",iid))
+    return _card("选择时间",f"**{title}**\n{custom_date}\n选择时间段：",btns)
 def build_confirm_card(iid,title,proposal):
     s,d=proposal.get("start","?"),proposal.get("due","?")
     return _card("确认操作",f"**{title}**\n{s} → {d}\n确认？",[_btn("确认","confirm","primary",iid),_btn("取消","cancel","danger",iid)])
@@ -142,10 +153,10 @@ def atomic_claim(iid,token,expected_state):
 
 # ── Validation ──
 _ALL_ACTIONS=frozenset({"start","snooze","reschedule","complete","extend",
-    "extend_confirm","reschedule_pick","reschedule_custom","reschedule_custom_submit",
-    "reschedule_cancel","confirm","cancel"})
-_SECONDARY_ACTIONS=frozenset({"extend_confirm","reschedule_pick","reschedule_custom",
+    "extend_confirm","reschedule_pick","reschedule_custom","reschedule_custom_pick_date",
     "reschedule_custom_submit","reschedule_cancel","confirm","cancel"})
+_SECONDARY_ACTIONS=frozenset({"extend_confirm","reschedule_pick","reschedule_custom",
+    "reschedule_custom_pick_date","reschedule_custom_submit","reschedule_cancel","confirm","cancel"})
 _VALID_STATES=frozenset({S_PENDING,S_CHOOSING_EXTEND,S_CHOOSING_SLOT,S_CHOOSING_CUSTOM,S_APPLYING,S_AWAITING_CONFIRMATION})
 
 def validate_click(iid,oid,chat,mid,action,token):
@@ -202,10 +213,17 @@ def dispatch_action(iid,action,token,params=None):
         update_interaction(iid,{"state":S_CHOOSING_CUSTOM})
         return {"status":"choosing_custom","card":build_custom_date_card(iid,d.get("task_title",d["page_id"]))}
 
+    if action=="reschedule_custom_pick_date":
+        err=atomic_claim(iid,token,S_CHOOSING_CUSTOM)
+        if err: return {"status":err}
+        custom_date=params.get("custom_date","")
+        if not custom_date: update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_date"}
+        update_interaction(iid,{"custom_date":custom_date})
+        return {"status":"choose_time","card":build_custom_time_card(iid,d.get("task_title",d["page_id"]),custom_date)}
+
     if action=="reschedule_cancel":
         err=atomic_claim(iid,token,S_CHOOSING_CUSTOM)
         if err: return {"status":err}
-        # Return to slot pick
         sr=suggest_slots(d["page_id"])
         if not sr.get("success") or not sr.get("slots"): update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_slots"}
         update_interaction(iid,{"state":S_CHOOSING_SLOT,"slot_candidates":sr["slots"]})
@@ -214,11 +232,9 @@ def dispatch_action(iid,action,token,params=None):
     if action=="reschedule_custom_submit":
         err=atomic_claim(iid,token,S_CHOOSING_CUSTOM)
         if err: return {"status":err}
-        custom_date=params.get("custom_date","")
-        if not custom_date: update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_date"}
-        # Use exact start/due from custom date + default time range
-        custom_start=f"{custom_date}T08:00:00+08:00"
-        custom_due=f"{custom_date}T18:00:00+08:00"
+        custom_start=params.get("custom_start","")
+        custom_due=params.get("custom_due","")
+        if not custom_start or not custom_due: update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_time"}
         sr=suggest_slots(d["page_id"],start=custom_start,due=custom_due)
         if not sr.get("success"): update_interaction(iid,{"state":S_CONFLICT}); return {"status":"slots_error"}
         requested=sr.get("requested",{})
