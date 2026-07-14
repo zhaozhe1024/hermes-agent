@@ -2670,6 +2670,16 @@ class FeishuAdapter(BasePlatformAdapter):
         event = getattr(data, "event", None)
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
+        # Merge form_value for date/time picker fields
+        form_value = getattr(action, "form_value", None)
+        if form_value:
+            try:
+                fv = json.loads(form_value) if isinstance(form_value, str) else dict(form_value)
+            except (json.JSONDecodeError, TypeError):
+                fv = {}
+            for key in ("custom_date", "custom_start_time", "custom_due_time"):
+                if key in fv and key not in action_value:
+                    action_value[key] = fv[key]
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
         update_prompt_action = (
             action_value.get("hermes_update_prompt_action")

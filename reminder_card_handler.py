@@ -59,26 +59,18 @@ def build_reschedule_card(iid,title,slots):
     btns=[_btn(f"{s.get('start','?')} → {s.get('due','?')}","reschedule_pick","primary" if i==0 else "default",iid,slot_index=i) for i,s in enumerate(slots[:5])]
     btns.append(_btn("自定义时间","reschedule_custom","default",iid,task_title=title))
     return _card("重新安排时间",f"**{title}**\n选择新时间：",btns)
-def build_custom_date_card(iid,title):
-    today=datetime.now().date()
-    btns=[_btn(f"{today+timedelta(days=d)}（{'今天' if d==0 else '明天' if d==1 else str(d)+'天后'}）",
-               "reschedule_custom_pick_date","primary" if d==0 else "default",iid,
-               custom_date=f"{today+timedelta(days=d)}") for d in range(14)]
-    btns.append(_btn("返回推荐时间","reschedule_cancel","danger",iid))
-    return _card("选择日期",f"**{title}**\n选择日期：",btns)
-
-def build_custom_time_card(iid, title, custom_date):
-    """Card with date_picker + start/end time pickers + submit button."""
+def build_custom_time_card(iid, title):
+    """Card with date_picker + start/end time pickers + submit."""
     return {
         "config": {"wide_screen_mode": True},
         "header": {"title": {"content": "自定义时间", "tag": "plain_text"}, "template": "blue"},
         "elements": [
             {"tag": "markdown", "content": f"**{title}**\n选择具体时间："},
-            {"tag": "date_picker", "initial_date": custom_date,
+            {"tag": "date_picker", "name": "custom_date",
              "placeholder": {"tag": "plain_text", "content": "选择日期"}},
-            {"tag": "picker_time", "initial_time": "09:00",
+            {"tag": "picker_time", "name": "custom_start_time",
              "placeholder": {"tag": "plain_text", "content": "开始时间"}},
-            {"tag": "picker_time", "initial_time": "10:00",
+            {"tag": "picker_time", "name": "custom_due_time",
              "placeholder": {"tag": "plain_text", "content": "结束时间"}},
             {"tag": "action", "actions": [
                 {"tag": "button", "text": {"tag": "plain_text", "content": "确认"},
@@ -168,10 +160,10 @@ def atomic_claim(iid,token,expected_state,next_state=None):
 
 # ── Validation ──
 _ALL_ACTIONS=frozenset({"start","snooze","reschedule","complete","extend",
-    "extend_confirm","reschedule_pick","reschedule_custom","reschedule_custom_pick_date",
+    "extend_confirm","reschedule_pick","reschedule_custom",
     "reschedule_custom_submit","reschedule_cancel","confirm","cancel"})
 _SECONDARY_ACTIONS=frozenset({"extend_confirm","reschedule_pick","reschedule_custom",
-    "reschedule_custom_pick_date","reschedule_custom_submit","reschedule_cancel","confirm","cancel"})
+    "reschedule_custom_submit","reschedule_cancel","confirm","cancel"})
 _VALID_STATES=frozenset({S_PENDING,S_CHOOSING_EXTEND,S_CHOOSING_SLOT,S_CHOOSING_CUSTOM,S_APPLYING,S_AWAITING_CONFIRMATION})
 
 def validate_click(iid,oid,chat,mid,action,token):
@@ -226,15 +218,7 @@ def dispatch_action(iid,action,token,params=None):
         err=atomic_claim(iid,token,S_CHOOSING_SLOT,next_state=S_CHOOSING_CUSTOM)
         if err: return {"status":err}
         update_interaction(iid,{"state":S_CHOOSING_CUSTOM})
-        return {"status":"choosing_custom","card":build_custom_date_card(iid,d.get("task_title",d["page_id"]))}
-
-    if action=="reschedule_custom_pick_date":
-        err=atomic_claim(iid,token,S_CHOOSING_CUSTOM,next_state=S_CHOOSING_CUSTOM)
-        if err: return {"status":err}
-        custom_date=params.get("custom_date","")
-        if not custom_date: update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_date"}
-        update_interaction(iid,{"custom_date":custom_date})
-        return {"status":"choose_time","card":build_custom_time_card(iid,d.get("task_title",d["page_id"]),custom_date)}
+        return {"status":"choosing_custom","card":build_custom_time_card(iid,d.get("task_title",d["page_id"]))}
 
     if action=="reschedule_cancel":
         err=atomic_claim(iid,token,S_CHOOSING_CUSTOM,next_state=S_CHOOSING_SLOT)
@@ -247,9 +231,18 @@ def dispatch_action(iid,action,token,params=None):
     if action=="reschedule_custom_submit":
         err=atomic_claim(iid,token,S_CHOOSING_CUSTOM)
         if err: return {"status":err}
-        custom_start=params.get("custom_start","")
-        custom_due=params.get("custom_due","")
-        if not custom_start or not custom_due: update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_time"}
+        custom_date=params.get("custom_date","")
+        start_time=params.get("custom_start_time","")
+        due_time=params.get("custom_due_time","")
+        if not custom_date or not start_time or not due_time:
+            update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_time"}
+        custom_start=f"{custom_date}T{start_time}:00+08:00"
+        custom_due=f"{custom_date}T{due_time}:00+08:00"
+        # Validate: due > start, same day
+        try:
+            sd=datetime.fromisoformat(custom_start); dd=datetime.fromisoformat(custom_due)
+            if dd<=sd: update_interaction(iid,{"state":S_CONFLICT}); return {"status":"due_before_start"}
+        except: pass
         sr=suggest_slots(d["page_id"],start=custom_start,due=custom_due)
         if not sr.get("success"): update_interaction(iid,{"state":S_CONFLICT}); return {"status":"slots_error"}
         requested=sr.get("requested",{})

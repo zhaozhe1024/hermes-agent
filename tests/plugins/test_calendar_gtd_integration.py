@@ -867,36 +867,35 @@ class TestCustomTimeFlow:
         monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
         return rch
 
-    def test_reschedule_custom_goes_to_choosing_custom(self, s):
+    def test_reschedule_custom_goes_to_choosing_custom_with_time_card(self, s):
         s.persist_interaction("ic1","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
         s.update_interaction("ic1",{"state":"choosing_slot","slot_candidates":[]})
         r = s.dispatch_action("ic1","reschedule_custom","t1")
         assert r["status"] == "choosing_custom"
+        assert "card" in r
+        # Verify card has date_picker and time pickers
+        c = r["card"]
+        tags = [e["tag"] for e in c["elements"]]
+        assert "date_picker" in tags
+        assert "picker_time" in tags
         assert s.get_interaction("ic1")["state"] == "choosing_custom"
 
-    def test_pick_date_shows_time_card(self, s):
-        s.persist_interaction("icd","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
-        s.update_interaction("icd",{"state":"choosing_custom"})
-        r = s.dispatch_action("icd","reschedule_custom_pick_date","td",{"custom_date":"2026-07-15"})
-        assert r["status"] == "choose_time"
-        assert "card" in r
-
-    def test_custom_submit_exact_start_due(self, s):
+    def test_custom_submit_date_time_passed_to_suggest_slots(self, s):
         s.persist_interaction("ic2","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
         s.update_interaction("ic2",{"state":"choosing_custom"})
         calls = []
         def fake_slots(*a, **kw): calls.append(kw); return {"success":True,"slots":[],"requested":{"available":False}}
         with patch("reminder_card_handler.suggest_slots", side_effect=fake_slots):
             r = s.dispatch_action("ic2","reschedule_custom_submit","t2",
-                {"custom_start":"2026-07-15T14:00:00+08:00","custom_due":"2026-07-15T15:00:00+08:00"})
+                {"custom_date":"2026-07-15","custom_start_time":"14:00","custom_due_time":"14:30"})
         assert r["status"] == "no_slots"
         assert calls and calls[-1].get("start") == "2026-07-15T14:00:00+08:00"
-        assert calls[-1].get("due") == "2026-07-15T15:00:00+08:00"
+        assert calls[-1].get("due") == "2026-07-15T14:30:00+08:00"
 
     def test_custom_submit_available_confirm(self, s):
         s.persist_interaction("ic3","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
         s.update_interaction("ic3",{"state":"choosing_custom"})
-        na = {"action":"reschedule","start":"2026-07-15T14:00:00+08:00","due":"2026-07-15T15:00:00+08:00"}
+        na = {"action":"reschedule","start":"2026-07-15T14:00:00+08:00","due":"2026-07-15T14:30:00+08:00"}
         with patch("reminder_card_handler.suggest_slots") as m1,\
              patch("reminder_card_handler.show_task") as m2,\
              patch("reminder_card_handler.create_session") as m3,\
@@ -908,7 +907,7 @@ class TestCustomTimeFlow:
             m4.return_value = {"success":True,"status":"confirmation_required","proposal":na}
             m5.return_value = {"confirmation_token":"tok","confirmation_expires_at":"2099-01-01T00:00:00+00:00"}
             r = s.dispatch_action("ic3","reschedule_custom_submit","t3",
-                {"custom_start":"2026-07-15T14:00:00+08:00","custom_due":"2026-07-15T15:00:00+08:00"})
+                {"custom_date":"2026-07-15","custom_start_time":"14:00","custom_due_time":"14:30"})
         assert r["status"] == "confirmation_required"
 
     def test_custom_submit_unavailable_shows_slots(self, s):
@@ -918,7 +917,7 @@ class TestCustomTimeFlow:
         with patch("reminder_card_handler.suggest_slots") as m:
             m.return_value = {"success":True,"slots":slots,"requested":{"available":False}}
             r = s.dispatch_action("ic4","reschedule_custom_submit","t4",
-                {"custom_start":"2026-07-15T10:00:00+08:00","custom_due":"2026-07-15T11:00:00+08:00"})
+                {"custom_date":"2026-07-15","custom_start_time":"10:00","custom_due_time":"11:00"})
         assert r["status"] == "choose_slot"
         assert s.get_interaction("ic4")["slot_candidates"] == slots
 
@@ -939,14 +938,14 @@ class TestCustomTimeFlow:
     def test_custom_submit_from_non_custom_rejected(self, s):
         s.persist_interaction("ic7","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
         r = s.dispatch_action("ic7","reschedule_custom_submit","t7",
-            {"custom_start":"2026-07-15T10:00+08:00","custom_due":"2026-07-15T11:00+08:00"})
+            {"custom_date":"2026-07-15","custom_start_time":"10:00","custom_due_time":"11:00"})
         assert "state not choosing_custom" in r.get("status","").lower()
 
 
 # ── Sequential chain + adapter dispatch tests ────────────────────────────────
 
 class TestSequentialChain:
-    """End-to-end: reschedule → custom → pick_date → submit → confirm, no state punching."""
+    """End-to-end: reschedule → custom → submit → confirm, no state punching."""
     @pytest.fixture
     def s(self, tmp_path, monkeypatch):
         monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
@@ -968,12 +967,7 @@ class TestSequentialChain:
         assert r["status"] == "choosing_custom"
         assert s.get_interaction("ich")["state"] == "choosing_custom"
 
-        # 3. Pick date → time card
-        r = s.dispatch_action("ich","reschedule_custom_pick_date","t3",{"custom_date":"2026-07-15"})
-        assert r["status"] == "choose_time"
-        assert s.get_interaction("ich")["state"] == "choosing_custom"  # state preserved
-
-        # 4. Pick time → submit
+        # 3. Submit custom time
         na = {"start":"2026-07-15T14:00:00+08:00","due":"2026-07-15T14:30:00+08:00"}
         with patch("reminder_card_handler.suggest_slots") as m1,\
              patch("reminder_card_handler.show_task") as m2,\
@@ -986,10 +980,10 @@ class TestSequentialChain:
             m4.return_value = {"success":True,"status":"confirmation_required","proposal":na}
             m5.return_value = {"confirmation_token":"tok","confirmation_expires_at":"2099"}
             r = s.dispatch_action("ich","reschedule_custom_submit","t4",
-                {"custom_start":"2026-07-15T14:00:00+08:00","custom_due":"2026-07-15T14:30:00+08:00"})
+                {"custom_date":"2026-07-15","custom_start_time":"14:00","custom_due_time":"14:30"})
         assert r["status"] == "confirmation_required"
 
-        # 5. Confirm
+        # 4. Confirm
         with patch("reminder_card_handler.execute_action") as m:
             m.return_value = {"success":True,"status":"applied"}
             r = s.dispatch_action("ich","confirm","t5")
@@ -1076,7 +1070,48 @@ def test_custom_submit_exact_args_to_suggest_slots():
     def fake(*a, **kw): calls.append(kw); return {"success":True,"slots":[],"requested":{"available":False}}
     with patch("reminder_card_handler.suggest_slots", side_effect=fake):
         rch.dispatch_action("ict","reschedule_custom_submit","tx",{
-            "custom_start":"2026-08-01T14:30:00+08:00","custom_due":"2026-08-01T16:00:00+08:00"})
+            "custom_date":"2026-08-01","custom_start_time":"14:30","custom_due_time":"16:00"})
     assert calls
     assert calls[-1].get("start") == "2026-08-01T14:30:00+08:00"
     assert calls[-1].get("due") == "2026-08-01T16:00:00+08:00"
+
+
+class TestSDKCallbackWithFormValue:
+    """Test _on_card_action_trigger with form_value carrying picker selections."""
+
+    def test_form_value_merged_into_action_value(self):
+        """Form value with date/time picker fields → custom_start/custom_due built as ISO."""
+        import reminder_card_handler as rch, tempfile
+        td = tempfile.mkdtemp()
+        import os as _os
+        _os.environ["FEISHU_ALLOWED_USERS"] = "ou_frank"
+        _os.environ["FEISHU_FRANK_CHAT_ID"] = "oc_frank"
+        rch._HERMES_HOME = td
+        rch.persist_interaction("ifv","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc_frank",[])
+        rch.update_interaction("ifv",{"state":"choosing_custom"})
+
+        calls = []
+        def fake_slots(*a, **kw): calls.append(kw); return {"success":True,"slots":[],"requested":{"available":False}}
+        with patch("reminder_card_handler.suggest_slots", side_effect=fake_slots):
+            # Simulate what adapter passes after merging form_value
+            params = {"custom_date":"2026-08-01","custom_start_time":"14:30","custom_due_time":"16:00"}
+            r = rch.dispatch_action("ifv","reschedule_custom_submit","tk",params)
+
+        assert calls
+        assert calls[-1].get("start") == "2026-08-01T14:30:00+08:00"
+        assert calls[-1].get("due") == "2026-08-01T16:00:00+08:00"
+
+    def test_form_value_due_before_start_rejected(self):
+        """Due time before start time returns due_before_start."""
+        import reminder_card_handler as rch, tempfile
+        td = tempfile.mkdtemp()
+        import os as _os
+        _os.environ["FEISHU_ALLOWED_USERS"] = "ou_frank"
+        _os.environ["FEISHU_FRANK_CHAT_ID"] = "oc_frank"
+        rch._HERMES_HOME = td
+        rch.persist_interaction("idb","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc_frank",[])
+        rch.update_interaction("idb",{"state":"choosing_custom"})
+
+        params = {"custom_date":"2026-08-01","custom_start_time":"16:00","custom_due_time":"14:30"}
+        r = rch.dispatch_action("idb","reschedule_custom_submit","tk",params)
+        assert r["status"] == "due_before_start"
