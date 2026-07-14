@@ -60,13 +60,14 @@ def build_reschedule_card(iid,title,slots):
     btns.append(_btn("自定义时间","reschedule_custom","default",iid,task_title=title))
     return _card("重新安排时间",f"**{title}**\n选择新时间：",btns)
 def build_custom_time_card(iid, title):
-    """Card with form-wrapped date_picker + time pickers + submit button."""
+    """Card with JSON 1.0 form: date_picker + time pickers + submit button."""
     return {
         "config": {"wide_screen_mode": True},
         "header": {"title": {"content": "自定义时间", "tag": "plain_text"}, "template": "blue"},
         "elements": [
             {
                 "tag": "form",
+                "name": "custom_time_form",
                 "elements": [
                     {"tag": "markdown", "content": f"**{title}**\n选择具体时间："},
                     {"tag": "date_picker", "name": "custom_date",
@@ -76,7 +77,7 @@ def build_custom_time_card(iid, title):
                     {"tag": "picker_time", "name": "custom_due_time",
                      "required": True, "placeholder": {"tag": "plain_text", "content": "结束时间"}},
                     {"tag": "button", "name": "custom_time_submit",
-                     "form_action_type": "submit",
+                     "complex_interaction": True, "action_type": "form_submit",
                      "text": {"tag": "plain_text", "content": "确认"},
                      "type": "primary",
                      "value": {"hermes_action": "pa_reminder",

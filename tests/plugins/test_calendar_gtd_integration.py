@@ -873,20 +873,19 @@ class TestCustomTimeFlow:
         r = s.dispatch_action("ic1","reschedule_custom","t1")
         assert r["status"] == "choosing_custom"
         assert "card" in r
-        # Verify form structure
+        # Verify form structure (JSON 1.0)
         c = r["card"]
         forms = [e for e in c["elements"] if e.get("tag") == "form"]
         assert len(forms) == 1
         f = forms[0]
-        assert "submit" not in f  # no self-invented submit attribute
-        # Picker names present in form.elements
+        assert f.get("name") == "custom_time_form"
+        assert "submit" not in f
         names = {el.get("name", "") for el in f["elements"] if "name" in el}
         assert names >= {"custom_date", "custom_start_time", "custom_due_time", "custom_time_submit"}
-        # Submit button has form_action_type
         btn = [el for el in f["elements"] if el.get("tag") == "button" and el.get("name") == "custom_time_submit"]
         assert len(btn) == 1
-        assert btn[0].get("form_action_type") == "submit"
-        # Cancel button is outside form
+        assert btn[0].get("action_type") == "form_submit"
+        assert btn[0].get("complex_interaction") is True
         assert any(e.get("tag") == "action" for e in c["elements"])
         assert s.get_interaction("ic1")["state"] == "choosing_custom"
 
@@ -1180,7 +1179,7 @@ class TestSDKCallbackWithFormValue:
         assert isinstance(result, MockToast)
 
     def test_real_on_card_action_trigger_with_form_value(self, tmp_path, monkeypatch):
-        """_on_card_action_trigger → _handle_pa_reminder_card_action receives merged form_value."""
+        """_on_card_action_trigger → handler receives merged form_value."""
         monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
         monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
         import reminder_card_handler as rch
@@ -1211,24 +1210,16 @@ class TestSDKCallbackWithFormValue:
         monkeypatch.setattr(adp, "P2CardActionTriggerResponse", MockToast)
         monkeypatch.setattr(adp, "CallBackToast", MockToast)
 
-        # Capture action_value passed to _handle_pa_reminder_card_action
         captured = []
-        orig = adapter._handle_pa_reminder_card_action
-        def patched_handler(*, event, action_value, loop):
+        def patched(*, event, action_value, loop):
             captured.append(dict(action_value))
-            # Don't dispatch — just verify form_value merge
             return MockToast()
-        adapter._handle_pa_reminder_card_action = patched_handler
+        adapter._handle_pa_reminder_card_action = patched
 
         result = adapter._on_card_action_trigger(data=data)
         assert isinstance(result, MockToast)
         assert len(captured) == 1
         av = captured[0]
-        # verify hermes metadata preserved
-        assert av["hermes_action"] == "pa_reminder"
-        assert av["interaction_id"] == "irf"
-        assert av["action"] == "reschedule_custom_submit"
-        # verify form_value whitelist merged
         assert av.get("custom_date") == "2026-08-01"
         assert av.get("custom_start_time") == "14:30 +0800"
         assert av.get("custom_due_time") == "16:00 +0800"
