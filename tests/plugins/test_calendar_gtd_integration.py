@@ -873,14 +873,21 @@ class TestCustomTimeFlow:
         r = s.dispatch_action("ic1","reschedule_custom","t1")
         assert r["status"] == "choosing_custom"
         assert "card" in r
-        # Verify form container, names, submit
+        # Verify form structure
         c = r["card"]
         forms = [e for e in c["elements"] if e.get("tag") == "form"]
         assert len(forms) == 1
         f = forms[0]
-        names = {el["name"] for el in f["elements"] if "name" in el}
-        assert names >= {"custom_date", "custom_start_time", "custom_due_time"}
-        assert "submit" in f
+        assert "submit" not in f  # no self-invented submit attribute
+        # Picker names present in form.elements
+        names = {el.get("name", "") for el in f["elements"] if "name" in el}
+        assert names >= {"custom_date", "custom_start_time", "custom_due_time", "custom_time_submit"}
+        # Submit button has form_action_type
+        btn = [el for el in f["elements"] if el.get("tag") == "button" and el.get("name") == "custom_time_submit"]
+        assert len(btn) == 1
+        assert btn[0].get("form_action_type") == "submit"
+        # Cancel button is outside form
+        assert any(e.get("tag") == "action" for e in c["elements"])
         assert s.get_interaction("ic1")["state"] == "choosing_custom"
 
     def test_custom_submit_date_time_passed_to_suggest_slots(self, s):
@@ -1172,38 +1179,56 @@ class TestSDKCallbackWithFormValue:
         # Should return a toast response (system busy since no async loop)
         assert isinstance(result, MockToast)
 
-    def test_real_callback_with_form_value(self, tmp_path, monkeypatch):
-        """_on_card_action_trigger with Feishu form_value containing picker selections."""
+    def test_real_on_card_action_trigger_with_form_value(self, tmp_path, monkeypatch):
+        """_on_card_action_trigger → _handle_pa_reminder_card_action receives merged form_value."""
         monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
         monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
         import reminder_card_handler as rch
         monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
-        rch.persist_interaction("if2","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om2","oc_frank",[])
-        rch.update_interaction("if2",{"state":"choosing_custom"})
+        rch.persist_interaction("irf","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om3","oc_frank",
+                                ["reschedule_custom_submit","reschedule_cancel"])
+        rch.update_interaction("irf",{"state":"choosing_custom"})
 
         from types import SimpleNamespace
         action = SimpleNamespace(
-            value={"hermes_action":"pa_reminder","interaction_id":"if2","action":"reschedule_custom_submit"},
+            value={"hermes_action":"pa_reminder","interaction_id":"irf","action":"reschedule_custom_submit"},
             form_value={"custom_date":"2026-08-01","custom_start_time":"14:30 +0800","custom_due_time":"16:00 +0800"},
             tag="button",
         )
-        operator = SimpleNamespace(open_id="ou_frank")
-        context = SimpleNamespace(open_chat_id="oc_frank", open_message_id="om2")
-        event = SimpleNamespace(action=action, operator=operator, context=context, token="tok-f")
+        event = SimpleNamespace(
+            action=action,
+            operator=SimpleNamespace(open_id="ou_frank"),
+            context=SimpleNamespace(open_chat_id="oc_frank", open_message_id="om3"),
+            token="tok-rf",
+        )
         data = SimpleNamespace(event=event)
 
         import plugins.platforms.feishu.adapter as adp
         adapter = object.__new__(adp.FeishuAdapter)
-        adapter._derive_card_uuid = lambda iid, ctx: "uuid-"+iid
+        adapter._loop = True
 
-        # Verify form_value merging
-        av = getattr(action, "value", {}) or {}
-        fv = getattr(action, "form_value", None)
-        import json as _j
-        fv_dict = _j.loads(fv) if isinstance(fv, str) else dict(fv or {})
-        for k in ("custom_date","custom_start_time","custom_due_time"):
-            if k in fv_dict and k not in av:
-                av[k] = fv_dict[k]
+        class MockToast: pass
+        monkeypatch.setattr(adp, "P2CardActionTriggerResponse", MockToast)
+        monkeypatch.setattr(adp, "CallBackToast", MockToast)
+
+        # Capture action_value passed to _handle_pa_reminder_card_action
+        captured = []
+        orig = adapter._handle_pa_reminder_card_action
+        def patched_handler(*, event, action_value, loop):
+            captured.append(dict(action_value))
+            # Don't dispatch — just verify form_value merge
+            return MockToast()
+        adapter._handle_pa_reminder_card_action = patched_handler
+
+        result = adapter._on_card_action_trigger(data=data)
+        assert isinstance(result, MockToast)
+        assert len(captured) == 1
+        av = captured[0]
+        # verify hermes metadata preserved
+        assert av["hermes_action"] == "pa_reminder"
+        assert av["interaction_id"] == "irf"
+        assert av["action"] == "reschedule_custom_submit"
+        # verify form_value whitelist merged
         assert av.get("custom_date") == "2026-08-01"
         assert av.get("custom_start_time") == "14:30 +0800"
         assert av.get("custom_due_time") == "16:00 +0800"

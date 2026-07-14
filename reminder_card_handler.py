@@ -60,30 +60,35 @@ def build_reschedule_card(iid,title,slots):
     btns.append(_btn("自定义时间","reschedule_custom","default",iid,task_title=title))
     return _card("重新安排时间",f"**{title}**\n选择新时间：",btns)
 def build_custom_time_card(iid, title):
-    """Card with form-wrapped date_picker + time pickers + submit."""
+    """Card with form-wrapped date_picker + time pickers + submit button."""
     return {
         "config": {"wide_screen_mode": True},
         "header": {"title": {"content": "自定义时间", "tag": "plain_text"}, "template": "blue"},
-        "elements": [{
-            "tag": "form",
-            "elements": [
-                {"tag": "markdown", "content": f"**{title}**\n选择具体时间："},
-                {"tag": "date_picker", "name": "custom_date",
-                 "required": True, "placeholder": {"tag": "plain_text", "content": "选择日期"}},
-                {"tag": "picker_time", "name": "custom_start_time",
-                 "required": True, "placeholder": {"tag": "plain_text", "content": "开始时间"}},
-                {"tag": "picker_time", "name": "custom_due_time",
-                 "required": True, "placeholder": {"tag": "plain_text", "content": "结束时间"}},
-            ],
-            "submit": {"tag": "action", "actions": [
-                {"tag": "button", "text": {"tag": "plain_text", "content": "确认"},
-                 "type": "primary", "value": {"hermes_action": "pa_reminder",
-                 "interaction_id": iid, "action": "reschedule_custom_submit"}},
+        "elements": [
+            {
+                "tag": "form",
+                "elements": [
+                    {"tag": "markdown", "content": f"**{title}**\n选择具体时间："},
+                    {"tag": "date_picker", "name": "custom_date",
+                     "required": True, "placeholder": {"tag": "plain_text", "content": "选择日期"}},
+                    {"tag": "picker_time", "name": "custom_start_time",
+                     "required": True, "placeholder": {"tag": "plain_text", "content": "开始时间"}},
+                    {"tag": "picker_time", "name": "custom_due_time",
+                     "required": True, "placeholder": {"tag": "plain_text", "content": "结束时间"}},
+                    {"tag": "button", "name": "custom_time_submit",
+                     "form_action_type": "submit",
+                     "text": {"tag": "plain_text", "content": "确认"},
+                     "type": "primary",
+                     "value": {"hermes_action": "pa_reminder",
+                               "interaction_id": iid, "action": "reschedule_custom_submit"}},
+                ],
+            },
+            {"tag": "action", "actions": [
                 {"tag": "button", "text": {"tag": "plain_text", "content": "返回推荐时间"},
                  "type": "danger", "value": {"hermes_action": "pa_reminder",
                  "interaction_id": iid, "action": "reschedule_cancel"}},
             ]},
-        }],
+        ],
     }
 def build_confirm_card(iid,title,proposal):
     s,d=proposal.get("start","?"),proposal.get("due","?")
