@@ -854,3 +854,86 @@ class TestE2ECardDispatch:
             r2 = s.dispatch_action("icc","start","tcc2")
             assert r1["status"] == "succeeded"
             assert "not pending" in r2.get("status","").lower()
+
+
+# ── Custom time flow tests ───────────────────────────────────────────────────
+
+class TestCustomTimeFlow:
+    @pytest.fixture
+    def s(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FEISHU_ALLOWED_USERS", "ou_frank")
+        monkeypatch.setenv("FEISHU_FRANK_CHAT_ID", "oc_frank")
+        import reminder_card_handler as rch
+        monkeypatch.setattr(rch, "_HERMES_HOME", str(tmp_path))
+        return rch
+
+    def test_reschedule_custom_goes_to_choosing_custom(self, s):
+        s.persist_interaction("ic1","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
+        s.update_interaction("ic1",{"state":"choosing_slot","slot_candidates":[]})
+        r = s.dispatch_action("ic1","reschedule_custom","t1")
+        assert r["status"] == "choosing_custom"
+        assert s.get_interaction("ic1")["state"] == "choosing_custom"
+
+    def test_custom_submit_exact_date_passed(self, s):
+        s.persist_interaction("ic2","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
+        s.update_interaction("ic2",{"state":"choosing_custom"})
+        calls = []
+        def fake_slots(*a, **kw): calls.append(kw); return {"success":True,"slots":[],"requested":{"available":False}}
+        with patch("reminder_card_handler.suggest_slots", side_effect=fake_slots):
+            r = s.dispatch_action("ic2","reschedule_custom_submit","t2",{"custom_date":"2026-07-15"})
+        assert r["status"] == "no_slots"  # available=false
+        assert calls
+        assert calls[-1].get("start") == "2026-07-15T08:00:00+08:00"
+        assert calls[-1].get("due") == "2026-07-15T18:00:00+08:00"
+
+    def test_custom_submit_available_goes_to_confirm(self, s):
+        s.persist_interaction("ic3","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
+        s.update_interaction("ic3",{"state":"choosing_custom"})
+        na = {"action":"reschedule","start":"2026-07-15T09:00:00+08:00","due":"2026-07-15T10:00:00+08:00"}
+        with patch("reminder_card_handler.suggest_slots") as m1,\
+             patch("reminder_card_handler.show_task") as m2,\
+             patch("reminder_card_handler.create_session") as m3,\
+             patch("reminder_card_handler.execute_action") as m4,\
+             patch("reminder_card_handler.get_session") as m5:
+            m1.return_value = {"success":True,"slots":[{}],"requested":{"available":True},"next_action":na}
+            m2.return_value = {"success":True,"version":"v1"}
+            m3.return_value = {"success":True}
+            m4.return_value = {"success":True,"status":"confirmation_required","proposal":na}
+            m5.return_value = {"confirmation_token":"tok","confirmation_expires_at":"2099-01-01T00:00:00+00:00"}
+            r = s.dispatch_action("ic3","reschedule_custom_submit","t3",{"custom_date":"2026-07-15"})
+        assert r["status"] == "confirmation_required"
+
+    def test_custom_submit_unavailable_shows_slots(self, s):
+        s.persist_interaction("ic4","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
+        s.update_interaction("ic4",{"state":"choosing_custom"})
+        slots = [{"start":"2026-07-16T09:00+08:00","due":"2026-07-16T10:00+08:00"}]
+        with patch("reminder_card_handler.suggest_slots") as m:
+            m.return_value = {"success":True,"slots":slots,"requested":{"available":False}}
+            r = s.dispatch_action("ic4","reschedule_custom_submit","t4",{"custom_date":"2026-07-15"})
+        assert r["status"] == "choose_slot"
+        assert "card" in r
+        d = s.get_interaction("ic4")
+        assert d["state"] == "choosing_slot"
+        assert d["slot_candidates"] == slots
+
+    def test_reschedule_cancel_returns_to_slot_pick(self, s):
+        s.persist_interaction("ic5","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
+        s.update_interaction("ic5",{"state":"choosing_custom"})
+        slots = [{"start":"S1","due":"D1"}]
+        with patch("reminder_card_handler.suggest_slots") as m:
+            m.return_value = {"success":True,"slots":slots}
+            r = s.dispatch_action("ic5","reschedule_cancel","t5")
+        assert r["status"] == "choose_slot"
+        assert s.get_interaction("ic5")["state"] == "choosing_slot"
+
+    def test_custom_submit_no_date_rejected(self, s):
+        s.persist_interaction("ic6","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
+        s.update_interaction("ic6",{"state":"choosing_custom"})
+        r = s.dispatch_action("ic6","reschedule_custom_submit","t6",{})
+        assert r["status"] == "no_date"
+        assert s.get_interaction("ic6")["state"] == "conflict"
+
+    def test_custom_submit_from_non_custom_rejected(self, s):
+        s.persist_interaction("ic7","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
+        r = s.dispatch_action("ic7","reschedule_custom_submit","t7",{"custom_date":"2026-07-15"})
+        assert "state not choosing_custom" in r.get("status","").lower()
