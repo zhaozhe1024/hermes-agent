@@ -245,14 +245,16 @@ def dispatch_action(iid,action,token,params=None):
         due_time=params.get("custom_due_time","")
         if not custom_date or not start_time or not due_time:
             update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_time"}
-        # Parse Feishu time format: "14:30" or "14:30 +0800"
+        # Parse Feishu picker formats: "2026-08-01 +0800" and "14:30 +0800".
         import re as _re
+        dm=_re.fullmatch(r"(\d{4}-\d{2}-\d{2})(?:\s+[+-]\d{4})?",str(custom_date).strip())
         def _parse_t(tv):
-            m=_re.match(r"(\d{1,2}:\d{2})", str(tv))
+            m=_re.fullmatch(r"(\d{1,2}:\d{2})(?:\s+[+-]\d{4})?",str(tv).strip())
             return m.group(1) if m else None
         st=_parse_t(start_time); dt=_parse_t(due_time)
-        if not st or not dt:
+        if not dm or not st or not dt:
             update_interaction(iid,{"state":S_CONFLICT}); return {"status":"invalid_time"}
+        custom_date=dm.group(1)
         custom_start=f"{custom_date}T{st}:00+08:00"
         custom_due=f"{custom_date}T{dt}:00+08:00"
         try:

@@ -31,7 +31,7 @@ _H = os.path.expanduser("~/.hermes")
 for d in ("hermes-agent", "scripts", "skills/calendar-gtd-integration/scripts"):
     p = os.path.join(_H, d)
     if p not in sys.path:
-        sys.path.insert(0, p)
+        sys.path.append(p)
 
 NS = uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
 
@@ -1066,7 +1066,7 @@ class TestAdapterDispatch:
 
 
 def test_custom_submit_exact_args_to_suggest_slots():
-    """Verify arbitrary custom_start/custom_due pass through to suggest_slots unchanged."""
+    """Verify real Feishu picker values become exact suggest_slots arguments."""
     import reminder_card_handler as rch, tempfile
     td = tempfile.mkdtemp()
     import os as _os
@@ -1079,7 +1079,8 @@ def test_custom_submit_exact_args_to_suggest_slots():
     def fake(*a, **kw): calls.append(kw); return {"success":True,"slots":[],"requested":{"available":False}}
     with patch("reminder_card_handler.suggest_slots", side_effect=fake):
         rch.dispatch_action("ict","reschedule_custom_submit","tx",{
-            "custom_date":"2026-08-01","custom_start_time":"14:30","custom_due_time":"16:00"})
+            "custom_date":"2026-08-01 +0800","custom_start_time":"14:30 +0800",
+            "custom_due_time":"16:00 +0800"})
     assert calls
     assert calls[-1].get("start") == "2026-08-01T14:30:00+08:00"
     assert calls[-1].get("due") == "2026-08-01T16:00:00+08:00"
@@ -1188,19 +1189,20 @@ class TestSDKCallbackWithFormValue:
                                 ["reschedule_custom_submit","reschedule_cancel"])
         rch.update_interaction("irf",{"state":"choosing_custom"})
 
-        from types import SimpleNamespace
-        action = SimpleNamespace(
-            value={"hermes_action":"pa_reminder","interaction_id":"irf","action":"reschedule_custom_submit"},
-            form_value={"custom_date":"2026-08-01","custom_start_time":"14:30 +0800","custom_due_time":"16:00 +0800"},
-            tag="button",
-        )
-        event = SimpleNamespace(
-            action=action,
-            operator=SimpleNamespace(open_id="ou_frank"),
-            context=SimpleNamespace(open_chat_id="oc_frank", open_message_id="om3"),
-            token="tok-rf",
-        )
-        data = SimpleNamespace(event=event)
+        from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTrigger
+        data = P2CardActionTrigger({"event": {
+            "action": {
+                "value": {"hermes_action":"pa_reminder","interaction_id":"irf",
+                          "action":"reschedule_custom_submit"},
+                "form_value": {"custom_date":"2026-08-01 +0800",
+                               "custom_start_time":"14:30 +0800",
+                               "custom_due_time":"16:00 +0800"},
+                "tag": "button",
+            },
+            "operator": {"open_id":"ou_frank"},
+            "context": {"open_chat_id":"oc_frank", "open_message_id":"om3"},
+            "token": "tok-rf",
+        }})
 
         import plugins.platforms.feishu.adapter as adp
         adapter = object.__new__(adp.FeishuAdapter)
@@ -1220,6 +1222,6 @@ class TestSDKCallbackWithFormValue:
         assert isinstance(result, MockToast)
         assert len(captured) == 1
         av = captured[0]
-        assert av.get("custom_date") == "2026-08-01"
+        assert av.get("custom_date") == "2026-08-01 +0800"
         assert av.get("custom_start_time") == "14:30 +0800"
         assert av.get("custom_due_time") == "16:00 +0800"
