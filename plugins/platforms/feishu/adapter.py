@@ -3035,7 +3035,9 @@ class FeishuAdapter(BasePlatformAdapter):
             card = result.get("card")
             if card and before:
                 snapshot = {"state": before.get("state"), "active_message_id": before.get("active_message_id")}
-                iuuid = self._derive_card_uuid(iid, status)
+                iuuid = self._derive_card_uuid(
+                    iid, f"{status}:{before.get('active_message_id', '')}"
+                )
                 sr = await self._send_card_to_chat(
                     chat_id=before["feishu_chat_id"], card=card,
                     idempotency_uuid=iuuid,

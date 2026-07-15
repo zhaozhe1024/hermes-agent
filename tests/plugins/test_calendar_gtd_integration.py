@@ -1013,7 +1013,8 @@ class TestAdapterDispatch:
         """Real adapter dispatch: pending → extend → success → choosing_extend + new msg_id."""
         import plugins.platforms.feishu.adapter as adp
         adapter = object.__new__(adp.FeishuAdapter)
-        adapter._derive_card_uuid = lambda iid, ctx: "uuid-"+iid
+        uuid_contexts = []
+        adapter._derive_card_uuid = lambda iid, ctx: uuid_contexts.append(ctx) or "uuid-"+iid
         import reminder_card_handler as rch
         s.persist_interaction("iads","dk",1,"completion","task.completion","2099-01-01T00:00:00+00:00","pg","om","oc_frank",["extend"])
 
@@ -1031,6 +1032,7 @@ class TestAdapterDispatch:
         d = s.get_interaction("iads")
         assert d["state"] == "choosing_extend"
         assert d["active_message_id"] == "new-msg-id"
+        assert uuid_contexts == ["choose_extend:om"]
 
     def test_real_dispatch_failure_restores_then_retry_succeeds(self, s):
         """First extend: send fails → back to pending. Second extend: send succeeds → choosing_extend."""
@@ -1063,7 +1065,6 @@ class TestAdapterDispatch:
         d2 = s.get_interaction("iadf")
         assert d2["state"] == "choosing_extend"
         assert d2["active_message_id"] == "new-ok"
-
 
 def test_custom_submit_exact_args_to_suggest_slots():
     """Verify real Feishu picker values become exact suggest_slots arguments."""
