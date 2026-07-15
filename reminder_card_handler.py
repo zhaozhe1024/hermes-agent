@@ -30,6 +30,28 @@ def _db(): return SessionDB(Path(os.path.join(_HERMES_HOME,"state.db")))
 def _ik(iid): return f"{IP}{iid}"
 def _tk(tok): return f"{TP}{tok}"
 
+_SHANGHAI=timezone(timedelta(hours=8))
+_MONTHS=("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
+def _as_shanghai(value):
+    try: dt=datetime.fromisoformat(str(value).replace("Z","+00:00"))
+    except (TypeError,ValueError): return None
+    if dt.tzinfo is None: dt=dt.replace(tzinfo=_SHANGHAI)
+    return dt.astimezone(_SHANGHAI)
+def _fmt_point(value):
+    dt=_as_shanghai(value)
+    return f"{dt.day:02d}{_MONTHS[dt.month-1]}{dt.year%100:02d} {dt:%H:%M}" if dt else str(value or "?")
+def _fmt_slot(start,due):
+    s,d=_as_shanghai(start),_as_shanghai(due)
+    if not s or not d: return f"{_fmt_point(start)}–{_fmt_point(due)}"
+    end=f"{d:%H:%M}" if s.date()==d.date() else _fmt_point(due)
+    return f"{_fmt_point(start)}–{end}"
+def _fmt_proposal(proposal):
+    start,due=(proposal or {}).get("start"),(proposal or {}).get("due")
+    if start and due: return _fmt_slot(start,due)
+    if start: return _fmt_point(start)
+    if due: return _fmt_point(due)
+    return ""
+
 # ── Cards ──
 def build_card(interaction_id=None, product_command=None, task_title=None,
                task_start=None, task_due=None, heading=None, *args):
@@ -43,26 +65,26 @@ def build_card(interaction_id=None, product_command=None, task_title=None,
     if pc=="task.snooze": acts=[("现在开始","start","primary"),("重新安排时间","reschedule","default")]
     elif pc=="task.start":
         l="到 HH:MM 再提醒"
-        if task_start:
-            try: l=f"到 {datetime.fromisoformat(task_start).strftime('%H:%M')} 再提醒"
-            except: pass
+        if task_start and (dt:=_as_shanghai(task_start)): l=f"到 {dt:%H:%M} 再提醒"
         acts=[("现在开始","start","primary"),(l,"snooze","default"),("重新安排时间","reschedule","default")]
     elif pc=="task.completion": acts=[("标记完成","complete","primary"),("延长时间","extend","default"),("重新安排时间","reschedule","default")]
     else: return _err("Unknown reminder type.")
-    tl=f"开始: {task_start}" if task_start else ""
-    if task_due: tl+=f"  →  完成: {task_due}"
+    tl=f"时间: {_fmt_slot(task_start,task_due)}" if task_start and task_due else ""
+    if task_start and not task_due: tl=f"开始: {_fmt_point(task_start)}"
+    if task_due and not task_start: tl=f"完成: {_fmt_point(task_due)}"
     return _card(heading,f"**{task_title}**\n{tl}",[_btn(l,a,t,interaction_id) for l,a,t in acts])
 
 def build_extend_card(iid,title): return _card("延长时间",f"**{title}**\n选择延长时间：",
     [_btn(f"+{m} 分钟","extend_confirm","primary" if m==15 else "default",iid,minutes=m) for m in (15,30,60)])
-def build_reschedule_card(iid,title,slots):
-    btns=[_btn(f"{s.get('start','?')} → {s.get('due','?')}","reschedule_pick","primary" if i==0 else "default",iid,slot_index=i) for i,s in enumerate(slots[:5])]
+def build_reschedule_card(iid,title,slots,selected=None):
+    btns=[_btn(_fmt_slot(s.get('start'),s.get('due')),"reschedule_pick","primary" if i==0 else "default",iid,slot_index=i) for i,s in enumerate(slots[:5])]
     btns.append(_btn("自定义时间","reschedule_custom","default",iid,task_title=title))
-    return _card("重新安排时间",f"**{title}**\n选择新时间：",btns)
+    prompt=(f"你选择的 **{_fmt_slot(*selected)}** 已被占用。\n请选择其他时间：" if selected else "选择新时间：")
+    return _card("时间冲突" if selected else "重新安排时间",f"**{title}**\n{prompt}",btns)
 def build_custom_time_card(iid, title):
     """Card with JSON 1.0 form: date_picker + time pickers + submit button."""
     return {
-        "config": {"wide_screen_mode": True},
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {"title": {"content": "自定义时间", "tag": "plain_text"}, "template": "blue"},
         "elements": [
             {
@@ -92,9 +114,12 @@ def build_custom_time_card(iid, title):
         ],
     }
 def build_confirm_card(iid,title,proposal):
-    s,d=proposal.get("start","?"),proposal.get("due","?")
-    return _card("确认操作",f"**{title}**\n{s} → {d}\n确认？",[_btn("确认","confirm","primary",iid),_btn("取消","cancel","danger",iid)])
-def _card(h,b,acts): return {"config":{"wide_screen_mode":True},"header":{"title":{"content":h,"tag":"plain_text"},"template":"orange" if h=="确认操作" else "blue"},"elements":[{"tag":"markdown","content":b},{"tag":"action","actions":acts}]}
+    return _card("确认操作",f"**{title}**\n{_fmt_proposal(proposal)}\n确认？",[_btn("确认","confirm","primary",iid),_btn("取消","cancel","danger",iid)])
+def build_status_card(title,heading,message,proposal=None,template="green"):
+    when=_fmt_proposal(proposal); timing=f"\n时间: {when}" if when else ""
+    return {"config":{"wide_screen_mode":True,"update_multi":True},"header":{"title":{"content":heading,"tag":"plain_text"},"template":template},"elements":[{"tag":"markdown","content":f"**{title}**\n{message}{timing}"}]}
+def build_consumed_card(title): return build_status_card(title,"已处理","请继续使用最新卡片。",template="grey")
+def _card(h,b,acts): return {"config":{"wide_screen_mode":True,"update_multi":True},"header":{"title":{"content":h,"tag":"plain_text"},"template":"orange" if h=="确认操作" else "blue"},"elements":[{"tag":"markdown","content":b},{"tag":"action","actions":acts}]}
 def _btn(label,action,bt,iid,**x): v={"hermes_action":"pa_reminder","interaction_id":iid,"action":action}; v.update(x); return {"tag":"button","text":{"tag":"plain_text","content":label},"type":bt,"value":v}
 def _err(m): return {"config":{"wide_screen_mode":True},"header":{"title":{"content":"Error","tag":"plain_text"},"template":"red"},"elements":[{"tag":"markdown","content":m}]}
 
@@ -275,7 +300,7 @@ def dispatch_action(iid,action,token,params=None):
         slots=sr.get("slots",[])
         if not slots: update_interaction(iid,{"state":S_CONFLICT}); return {"status":"no_slots"}
         update_interaction(iid,{"state":S_CHOOSING_SLOT,"slot_candidates":slots})
-        return {"status":"choose_slot","card":build_reschedule_card(iid,d.get("task_title",d["page_id"]),slots)}
+        return {"status":"choose_slot","card":build_reschedule_card(iid,d.get("task_title",d["page_id"]),slots,(custom_start,custom_due))}
 
     if action in ("start","complete"):
         err=atomic_claim(iid,token,S_PENDING)
@@ -294,14 +319,16 @@ def dispatch_action(iid,action,token,params=None):
         if err: return {"status":err}
         uid=os.environ.get("FEISHU_ALLOWED_USERS","").split(",")[0].strip()
         exe=execute_action(d["session_id"],feishu_chat_id=d["feishu_chat_id"],feishu_user_id=uid,confirmation_token=d["confirmation_token"])
-        update_interaction(iid,{"state":S_SUCCEEDED if exe.get("success") else S_CONFLICT})
-        return {"status":"succeeded" if exe.get("success") else "failed"}
+        ok=bool(exe.get("success")); update_interaction(iid,{"state":S_SUCCEEDED if ok else S_CONFLICT})
+        messages={"reschedule":"已确认重新安排。","extend":"已确认延长时间。","start":"已确认开始任务。","complete":"已确认完成任务。"}
+        card=build_status_card(d.get("task_title",d["page_id"]),"操作完成" if ok else "操作失败",messages.get(d.get("pending_action"),"操作已完成。") if ok else "未能完成操作，请稍后重试。",d.get("proposal"),"green" if ok else "red")
+        return {"status":"succeeded" if ok else "failed","replace_card":card}
 
     if action=="cancel":
         err=atomic_claim(iid,token,S_AWAITING_CONFIRMATION)
         if err: return {"status":err}
         update_interaction(iid,{"state":S_REJECTED,"result":"cancelled"})
-        return {"status":"cancelled"}
+        return {"status":"cancelled","replace_card":build_status_card(d.get("task_title",d["page_id"]),"已取消","操作已取消。",template="grey")}
 
     return {"status":"unknown_action"}
 
@@ -325,7 +352,7 @@ def _cx(d,action,start=None,due=None):
     if exe.get("status")=="confirmation_required":
         sess=get_session(sid); ctok=(sess or {}).get("confirmation_token",""); cexp=(sess or {}).get("confirmation_expires_at","")
         prop=exe.get("proposal",sess.get("proposal",{}) if sess else {})
-        update_interaction(d["interaction_id"],{"state":S_AWAITING_CONFIRMATION,"session_id":sid,"proposal":prop,"confirmation_token":ctok,"confirmation_expires_at":cexp})
+        update_interaction(d["interaction_id"],{"state":S_AWAITING_CONFIRMATION,"session_id":sid,"proposal":prop,"pending_action":action,"confirmation_token":ctok,"confirmation_expires_at":cexp})
         return {"status":"confirmation_required","card":build_confirm_card(d["interaction_id"],d.get("task_title",d["page_id"]),prop)}
     if exe.get("success"): update_interaction(d["interaction_id"],{"state":S_SUCCEEDED}); return {"status":"succeeded"}
     update_interaction(d["interaction_id"],{"state":S_CONFLICT}); return {"status":"failed"}

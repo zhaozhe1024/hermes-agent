@@ -571,6 +571,10 @@ class TestCardBuilding:
         assert "start" in actions
         assert "snooze" in actions
         assert "reschedule" in actions
+        assert card["config"]["update_multi"] is True
+        text = card["elements"][0]["content"]
+        assert "01Jan26 10:00–11:00" in text
+        assert "+08:00" not in text
         # All buttons have hermes_action=pa_reminder and interaction_id
         for b in buttons:
             assert b["value"]["hermes_action"] == "pa_reminder"
@@ -818,12 +822,17 @@ class TestE2ECardDispatch:
     def test_confirm_full_chain(self, s):
         s.persist_interaction("if","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
         s.update_interaction("if",{"state":"awaiting_confirmation","session_id":"sx",
-            "proposal":{"start":"S","due":"D"},"confirmation_token":"ctok",
-            "confirmation_expires_at":"2099-01-01T00:00:00+00:00","feishu_chat_id":"oc_frank"})
+            "proposal":{"start":"2026-07-17T10:00:00+08:00","due":"2026-07-17T10:30:00+08:00"},"confirmation_token":"ctok",
+            "confirmation_expires_at":"2099-01-01T00:00:00+00:00","feishu_chat_id":"oc_frank",
+            "pending_action":"reschedule"})
         with patch("reminder_card_handler.execute_action") as m:
             m.return_value = {"success":True,"status":"applied"}
             r = s.dispatch_action("if","confirm","tcf")
         assert r["status"] == "succeeded"
+        assert r["replace_card"]["header"]["title"]["content"] == "操作完成"
+        assert "已确认重新安排" in r["replace_card"]["elements"][0]["content"]
+        assert "17Jul26 10:00–10:30" in r["replace_card"]["elements"][0]["content"]
+        assert all(e.get("tag") != "action" for e in r["replace_card"]["elements"])
         assert s.get_interaction("if")["state"] == S_SUCCEEDED
 
     def test_cancel(self, s):
@@ -928,6 +937,10 @@ class TestCustomTimeFlow:
             r = s.dispatch_action("ic4","reschedule_custom_submit","t4",
                 {"custom_date":"2026-07-15","custom_start_time":"10:00","custom_due_time":"11:00"})
         assert r["status"] == "choose_slot"
+        assert r["card"]["header"]["title"]["content"] == "时间冲突"
+        assert "15Jul26 10:00–11:00" in r["card"]["elements"][0]["content"]
+        assert "已被占用" in r["card"]["elements"][0]["content"]
+        assert r["card"]["elements"][1]["actions"][0]["text"]["content"] == "16Jul26 09:00–10:00"
         assert s.get_interaction("ic4")["slot_candidates"] == slots
 
     def test_reschedule_cancel_returns_to_slot_pick(self, s):
@@ -1021,8 +1034,11 @@ class TestAdapterDispatch:
         class FR:
             success=True; message_id="new-msg-id"
         async def fake_send(**kw): return FR()
+        patched = []
+        async def fake_patch(**kw): patched.append(kw); return FR()
 
-        with patch.object(adapter, "_send_card_to_chat", new=fake_send):
+        with patch.object(adapter, "_send_card_to_chat", new=fake_send),\
+             patch.object(adapter, "_patch_card_message", new=fake_patch):
             async def run():
                 await adapter._dispatch_pa_reminder_action(iid="iads",action="extend",etok="t1",params={})
             import asyncio
@@ -1033,6 +1049,43 @@ class TestAdapterDispatch:
         assert d["state"] == "choosing_extend"
         assert d["active_message_id"] == "new-msg-id"
         assert uuid_contexts == ["choose_extend:om"]
+        assert patched[0]["message_id"] == "om"
+        assert patched[0]["card"]["header"]["template"] == "grey"
+        assert all(e.get("tag") != "action" for e in patched[0]["card"]["elements"])
+
+    def test_terminal_result_replaces_confirmation_card(self, s):
+        import asyncio
+        import plugins.platforms.feishu.adapter as adp
+        adapter = object.__new__(adp.FeishuAdapter)
+        s.persist_interaction("iat","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om-confirm","oc_frank",[])
+        s.update_interaction("iat",{"state":"awaiting_confirmation","session_id":"sx",
+            "proposal":{"start":"2026-07-17T10:00:00+08:00","due":"2026-07-17T10:30:00+08:00"},
+            "confirmation_token":"ctok","feishu_chat_id":"oc_frank"})
+        patched = []
+        class FR: success=True
+        async def fake_patch(**kw): patched.append(kw); return FR()
+        with patch("reminder_card_handler.execute_action", return_value={"success":True,"status":"applied"}),\
+             patch.object(adapter, "_patch_card_message", new=fake_patch):
+            asyncio.run(adapter._dispatch_pa_reminder_action(iid="iat",action="confirm",etok="t",params={}))
+        assert patched[0]["message_id"] == "om-confirm"
+        assert patched[0]["card"]["header"]["title"]["content"] == "操作完成"
+
+    def test_patch_card_uses_official_message_patch(self):
+        import asyncio
+        from types import SimpleNamespace
+        import plugins.platforms.feishu.adapter as adp
+        adapter = object.__new__(adp.FeishuAdapter)
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(patch=None)))
+        )
+        requests = []
+        async def fake_run(fn, request): requests.append(request); return object()
+        adapter._run_blocking = fake_run
+        adapter._finalize_send_result = lambda *a: adp.SendResult(success=True)
+        card = {"config":{"update_multi":True},"elements":[]}
+        result = asyncio.run(adapter._patch_card_message(message_id="om-card",card=card))
+        assert result.success and requests[0].message_id == "om-card"
+        assert json.loads(requests[0].request_body.content) == card
 
     def test_real_dispatch_failure_restores_then_retry_succeeds(self, s):
         """First extend: send fails → back to pending. Second extend: send succeeds → choosing_extend."""

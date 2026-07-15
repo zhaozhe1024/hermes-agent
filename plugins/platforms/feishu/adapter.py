@@ -99,6 +99,8 @@ try:
         GetMessageRequest,
         GetMessageResourceRequest,
         P2ImMessageMessageReadV1,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
         UpdateMessageRequest,
@@ -1377,6 +1379,7 @@ def check_feishu_requirements() -> bool:
             CreateMessageRequest, CreateMessageRequestBody,
             GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
             P2ImMessageMessageReadV1,
+            PatchMessageRequest, PatchMessageRequestBody,
             ReplyMessageRequest, ReplyMessageRequestBody,
             UpdateMessageRequest, UpdateMessageRequestBody,
         )
@@ -1401,6 +1404,8 @@ def check_feishu_requirements() -> bool:
             "GetMessageRequest": GetMessageRequest,
             "GetMessageResourceRequest": GetMessageResourceRequest,
             "P2ImMessageMessageReadV1": P2ImMessageMessageReadV1,
+            "PatchMessageRequest": PatchMessageRequest,
+            "PatchMessageRequestBody": PatchMessageRequestBody,
             "ReplyMessageRequest": ReplyMessageRequest,
             "ReplyMessageRequestBody": ReplyMessageRequestBody,
             "UpdateMessageRequest": UpdateMessageRequest,
@@ -3024,13 +3029,29 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _dispatch_pa_reminder_action(
         self, *, iid: str, action: str, etok: str, params: dict
     ) -> None:
-        from reminder_card_handler import dispatch_action, get_interaction, update_interaction
+        from reminder_card_handler import build_consumed_card, dispatch_action, get_interaction, update_interaction
 
         try:
             before = get_interaction(iid)
             result = dispatch_action(iid, action, etok, params)
             status = result.get("status","")
             logger.info("[Feishu] PA action %s → %s", action, status)
+
+            replacement = result.get("replace_card")
+            if replacement and before:
+                rr = await self._patch_card_message(
+                    message_id=before["active_message_id"], card=replacement,
+                )
+                if not rr.success:
+                    sr = await self._send_card_to_chat(
+                        chat_id=before["feishu_chat_id"], card=replacement,
+                        idempotency_uuid=self._derive_card_uuid(
+                            iid, f"{status}:{before.get('active_message_id', '')}:result"
+                        ),
+                    )
+                    if not sr or not sr.success:
+                        logger.error("[Feishu] Result card delivery failed for %s", iid)
+                return
 
             card = result.get("card")
             if card and before:
@@ -3044,6 +3065,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 if sr and sr.success:
                     update_interaction(iid, {"active_message_id": sr.message_id})
+                    rr = await self._patch_card_message(
+                        message_id=before["active_message_id"],
+                        card=build_consumed_card(before.get("task_title", before["page_id"])),
+                    )
+                    if not rr.success:
+                        logger.warning("[Feishu] Old PA card could not be disabled for %s", iid)
                 else:
                     logger.error("[Feishu] Card delivery failed for %s, restoring", iid)
                     update_interaction(iid, snapshot)
@@ -3055,6 +3082,24 @@ class FeishuAdapter(BasePlatformAdapter):
         """Deterministic UUID for idempotent secondary card delivery."""
         import uuid as _uuid
         return str(_uuid.uuid5(_uuid.NAMESPACE_OID, f"card:{iid}:{context}"))
+
+    async def _patch_card_message(self, *, message_id: str, card: dict) -> SendResult:
+        """Replace an interactive card so its old actions cannot be reused."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        try:
+            body = PatchMessageRequestBody.builder().content(
+                json.dumps(card, ensure_ascii=False)
+            ).build()
+            request = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
+            response = await self._run_blocking(self._client.im.v1.message.patch, request)
+            result = self._finalize_send_result(response, "card update failed")
+            if result.success:
+                result.message_id = message_id
+            return result
+        except Exception as exc:
+            logger.error("[Feishu] Card update failed for %s: %s", message_id, exc)
+            return SendResult(success=False, error=str(exc))
 
     async def _send_card_to_chat(self, *, chat_id, card,
                                   idempotency_uuid=None, reply_to=None, metadata=None):
