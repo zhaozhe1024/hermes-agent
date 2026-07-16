@@ -336,6 +336,32 @@ class TestCalendarImport:
         result = json.loads(proc.stdout)
         assert "allowed" in result
 
+    def test_subprocess_summary_separates_calendar_diff_from_notion_writes(self):
+        """The real handler process must not label local diff counts as writes."""
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable,
+             os.path.join(_H, "skills/calendar-gtd-integration/scripts/calendar_import_handler.py")],
+            input=json.dumps({
+                "command": "format_summary",
+                "args": {"summary": {
+                    "mode": "execute",
+                    "event_count": 36,
+                    "counts": {"create": 2, "noop": 34},
+                    "notion_operations": {"create_page": 36},
+                    "notion_results": {"success": 36},
+                    "safety": {"status": "ok", "write_count": 36},
+                }},
+            }),
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ},
+        )
+        assert proc.returncode == 0
+        text = json.loads(proc.stdout)["text"]
+        assert "Calendar diff (local state, not Notion writes): create: 2, noop: 34" in text
+        assert "Notion plan: create_page: 36" in text
+        assert "Notion results: success: 36" in text
+
 
 # ── process_one_claim (reminder worker) ─────────────────────────────────────
 
