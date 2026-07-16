@@ -826,6 +826,17 @@ class TestE2ECardDispatch:
                 expected_due = f"2026-01-01T{h:02d}:{m:02d}:00+08:00"
                 assert calls[-1].get("due") == expected_due, f"mins={mins}: expected {expected_due}, got {calls[-1].get('due')}"
 
+    def test_extend_invalid_due_fails_closed(self, s):
+        data = {"interaction_id":"invalid-due","page_id":"pg"}
+        with patch("reminder_card_handler.show_task", return_value={"success":True,"due":"invalid"}), \
+             patch("reminder_card_handler.update_interaction") as update, \
+             patch("reminder_card_handler._cx") as execute:
+            result = s._do_extend(data, 15)
+
+        assert result == {"status":"failed"}
+        update.assert_called_once_with("invalid-due", {"state":s.S_CONFLICT})
+        execute.assert_not_called()
+
     def test_slot_pick_uses_persisted_candidates(self, s):
         s.persist_interaction("ir","dk",1,"start","task.start","2099-01-01T00:00:00+00:00","pg","om","oc",[])
         slots = [{"start":"S1","due":"D1"},{"start":"S2","due":"D2"},{"start":"S3","due":"D3"}]

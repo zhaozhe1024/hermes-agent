@@ -190,7 +190,7 @@ def atomic_claim(iid,token,expected_state,next_state=None):
     except Exception as e: logger.error("atomic_claim: %s",e); return str(e)
     finally:
         try: db.close()
-        except: pass
+        except Exception: pass
 
 # ── Validation ──
 _ALL_ACTIONS=frozenset({"start","snooze","reschedule","complete","extend",
@@ -338,7 +338,9 @@ def _do_extend(d,mins):
     old=s.get("due"); new=old
     if old:
         try: new=(datetime.fromisoformat(old)+timedelta(minutes=mins)).isoformat()
-        except: pass
+        except (TypeError, ValueError):
+            update_interaction(d["interaction_id"],{"state":S_CONFLICT})
+            return {"status":"failed"}
     return _cx(d,"extend",due=new)
 def _do_reschedule(d,slot): s=show_task(d["page_id"]); return _cx(d,"reschedule",start=slot.get("start"),due=slot.get("due")) if s.get("success") else (update_interaction(d["interaction_id"],{"state":S_CONFLICT}) or {"status":"failed"})
 def _do_task(d,action): s=show_task(d["page_id"]); return _cx(d,action) if s.get("success") else (update_interaction(d["interaction_id"],{"state":S_CONFLICT}) or {"status":"failed"})
