@@ -45,6 +45,31 @@ def _mock_event_dispatcher_builder(mock_handler_class):
     return mock_builder
 
 
+class TestFeishuCardActionPlugins(unittest.TestCase):
+    @patch.dict(os.environ, {}, clear=True)
+    def test_plugin_can_consume_card_action(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._loop = SimpleNamespace(is_closed=lambda: False)
+        event = SimpleNamespace(
+            action=SimpleNamespace(value={"hermes_action": "plugin_action"}),
+        )
+        expected = object()
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"handled": True, "response": expected}],
+        ) as invoke:
+            actual = adapter._on_card_action_trigger(SimpleNamespace(event=event))
+
+        self.assertIs(actual, expected)
+        self.assertEqual(invoke.call_args.args, ("feishu_card_action",))
+        self.assertIs(invoke.call_args.kwargs["adapter"], adapter)
+        self.assertIs(invoke.call_args.kwargs["event"], event)
+
+
 class TestConfigEnvOverrides(unittest.TestCase):
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_xxx",
