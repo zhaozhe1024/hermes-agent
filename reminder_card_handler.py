@@ -25,10 +25,11 @@ from hermes_state import SessionDB
 S_PENDING,S_CHOOSING_EXTEND,S_CHOOSING_SLOT,S_CHOOSING_CUSTOM="pending","choosing_extend","choosing_slot","choosing_custom"
 S_APPLYING,S_AWAITING_CONFIRMATION="applying","awaiting_confirmation"
 S_SUCCEEDED,S_REJECTED,S_CONFLICT="succeeded","rejected","conflict"
-IP,TP="pa:interaction:","pa:interaction:token:"
+IP,TP,CP="pa:interaction:","pa:interaction:token:","pa:cardkit:"
 def _db(): return SessionDB(Path(os.path.join(_HERMES_HOME,"state.db")))
 def _ik(iid): return f"{IP}{iid}"
 def _tk(tok): return f"{TP}{tok}"
+def _ck(card_id): return f"{CP}{card_id}"
 
 _SHANGHAI=timezone(timedelta(hours=8))
 _MONTHS=("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
@@ -80,20 +81,73 @@ def build_card(interaction_id=None, product_command=None, task_title=None,
 
 def build_must_do_card(items):
     pending=sum(item.get("state",S_PENDING)!=S_SUCCEEDED for item in items)
-    elements=[]
-    for item in items:
-        state=item.get("state",S_PENDING); result=item.get("result","")
-        status=""
-        if state==S_SUCCEEDED: status="✅ 已完成" if result=="completed" else "⏰ 下一轮再提醒"
-        elif state==S_CONFLICT: status="⚠️ 操作失败，请等待下一轮提醒"
-        elif state in {S_APPLYING,S_AWAITING_CONFIRMATION}: status="⏳ 处理中"
-        elements.append({"tag":"markdown","content":f"{_task_block(item.get('task_title'))}\n{_meta(status)}" if status else _task_block(item.get("task_title"))})
+    elements=[{"tag":"markdown","element_id":"must_summary",
+               "content":_must_do_summary(pending)}]
+    for index,item in enumerate(items,1):
+        key=item.get("cardkit_element_key") or f"m{index}"
+        status=_must_do_status(item)
+        content=_grey_task(item.get("task_title")) if status else _task_block(item.get("task_title"))
+        if status: content=f"{content}\n{_meta(status)}"
+        elements.append({"tag":"markdown","element_id":f"{key}_text","content":content})
         if not status:
             elements.append(_action_row([
                 _btn("标记完成","complete","primary",item["interaction_id"]),
                 _btn("下一轮再提醒","must_do_later","default",item["interaction_id"]),
-            ]))
-    return _base_card(f"🚨 强力提醒 · {pending} 项待办",elements,"red")
+            ],element_id=f"{key}_actions"))
+    card=_base_card("🚨 强力提醒",elements,"red")
+    card["config"]["streaming_mode"]=True
+    card["config"]["streaming_config"]={
+        "print_frequency_ms":{"default":50,"android":50,"ios":50,"pc":50},
+        "print_step":{"default":1,"android":1,"ios":1,"pc":1},
+        "print_strategy":"fast",
+    }
+    return card
+
+def _must_do_summary(pending):
+    return f"**还有 {pending} 项必须完成**" if pending else "**本轮 Must Do 已处理完毕**"
+def _must_do_status(item):
+    state=item.get("state",S_PENDING); result=item.get("result","")
+    if state==S_SUCCEEDED: return "✅ 已完成" if result=="completed" else "⏰ 下一轮再提醒"
+    if state==S_CONFLICT: return "⚠️ 操作失败，请等待下一轮提醒"
+    if state in {S_APPLYING,S_AWAITING_CONFIRMATION}: return "⏳ 处理中"
+    if state==S_REJECTED: return "↩️ 已取消"
+    return ""
+def _grey_task(title): return f"<font color='grey'>{_task_block(title)}</font>"
+def _must_do_action_row(iid,key,disabled=False):
+    return _action_row([
+        _btn("标记完成","complete","primary",iid,disabled=disabled),
+        _btn("下一轮再提醒","must_do_later","default",iid,disabled=disabled),
+    ],element_id=f"{key}_actions")
+def build_must_do_cardkit_processing(data):
+    key=data["cardkit_element_key"]
+    base=_grey_task(data.get("task_title",data["page_id"]))
+    return {
+        "actions":[
+            {"action":"partial_update_element","params":{"element_id":f"{key}_text","partial_element":{"content":base}}},
+            {"action":"update_element","params":{"element_id":f"{key}_actions","element":_must_do_action_row(data["interaction_id"],key,True)}},
+        ],
+        "element_id":f"{key}_text",
+        "content":f"{base}\n⏳ PA 正在处理这项 Must Do…",
+    }
+def build_must_do_cardkit_result(data):
+    current=get_interaction(data["interaction_id"]) or data
+    items=[]
+    for item in data.get("group_items",[]):
+        saved=get_interaction(item["interaction_id"]) or {}
+        items.append({**item,"state":saved.get("state",S_PENDING),"result":saved.get("result","")})
+    pending=sum(item.get("state",S_PENDING)!=S_SUCCEEDED for item in items)
+    status=_must_do_status(current)
+    key=current["cardkit_element_key"]
+    content=_grey_task(current.get("task_title",current["page_id"])) if status else _task_block(current.get("task_title",current["page_id"]))
+    if status: content=f"{content}\n{status}"
+    return {
+        "actions":[
+            {"action":"partial_update_element","params":{"element_id":"must_summary","partial_element":{"content":_must_do_summary(pending)}}},
+            {"action":"partial_update_element","params":{"element_id":f"{key}_text","partial_element":{"content":content}}},
+            {"action":"update_element","params":{"element_id":f"{key}_actions","element":_must_do_action_row(current["interaction_id"],key,bool(status))}},
+        ],
+        "fallback_card":build_must_do_card(items),
+    }
 
 def build_extend_card(iid,title): return _card("延长时间",f"{_task_block(title)}\n选择延长时间：",
     [_btn(f"+{m} 分钟","extend_confirm","primary" if m==15 else "default",iid,minutes=m) for m in (15,30,60)])
@@ -133,16 +187,19 @@ def _base_card(h,elements,template="blue"):
     return {"schema":"2.0","config":{"update_multi":True,"width_mode":"fill"},
             "header":{"title":{"content":h,"tag":"plain_text"},"template":template},
             "body":{"direction":"vertical","vertical_spacing":"8px","elements":elements}}
-def _action_row(acts):
-    return {"tag":"column_set","flex_mode":"flow","horizontal_spacing":"8px",
-            "columns":[{"tag":"column","width":"auto","elements":[act]} for act in acts]}
+def _action_row(acts,element_id=None):
+    row={"tag":"column_set","flex_mode":"flow","horizontal_spacing":"8px",
+         "columns":[{"tag":"column","width":"auto","elements":[act]} for act in acts]}
+    if element_id: row["element_id"]=element_id
+    return row
 def _card(h,b,acts): return _base_card(h,[{"tag":"markdown","content":b},_action_row(acts)],"orange" if h=="确认操作" else "blue")
-def _btn(label,action,bt,iid,name=None,form_action_type=None,**x):
+def _btn(label,action,bt,iid,name=None,form_action_type=None,disabled=False,**x):
     v={"hermes_action":"pa_reminder","interaction_id":iid,"action":action}; v.update(x)
     button={"tag":"button","text":{"tag":"plain_text","content":label},"type":bt,
             "behaviors":[{"type":"callback","value":v}]}
     if name: button["name"]=name
     if form_action_type: button["form_action_type"]=form_action_type
+    if disabled: button["disabled"]=True
     return button
 def _err(m): return _base_card("Error",[{"tag":"markdown","content":m}],"red")
 
@@ -150,7 +207,8 @@ def _err(m): return _base_card("Error",[{"tag":"markdown","content":m}],"red")
 def persist_interaction(interaction_id=None, idempotency_key=None, reminder_id=None,
                         kind=None, product_command=None, expires_at=None, page_id=None,
                         feishu_message_id=None, feishu_chat_id=None, allowed_actions=None,
-                        task_title=None, snooze_expires_at=None, *args):
+                        task_title=None, snooze_expires_at=None, feishu_card_id=None,
+                        cardkit_element_key=None, *args):
     if args or interaction_id is None:
         vals=[interaction_id,idempotency_key,reminder_id,kind,product_command,
               expires_at,page_id,feishu_message_id,feishu_chat_id,allowed_actions]
@@ -170,6 +228,8 @@ def persist_interaction(interaction_id=None, idempotency_key=None, reminder_id=N
           "expires_at":expires_at,"page_id":page_id,
           "snooze_expires_at":snooze_expires_at,
           "active_message_id":feishu_message_id,"feishu_chat_id":feishu_chat_id,
+          "group_message_id":feishu_message_id if feishu_card_id else None,
+          "feishu_card_id":feishu_card_id,"cardkit_element_key":cardkit_element_key,
           "allowed_actions":allowed_actions,"task_title":task_title or page_id,
           "state":S_PENDING,"created_at":datetime.now(timezone.utc).isoformat()}
     d=_db()
@@ -187,6 +247,19 @@ def update_interaction(iid,upd):
     x.update(upd); d=_db()
     try: d.set_meta(_ik(iid),json.dumps(x))
     finally: d.close()
+def get_cardkit_sequence(card_id):
+    d=_db()
+    try:
+        raw=d.get_meta(_ck(card_id))
+        return int((json.loads(raw) if raw else {}).get("sequence",0))
+    finally: d.close()
+def set_cardkit_sequence(card_id,sequence):
+    d=_db()
+    try: d.set_meta(_ck(card_id),json.dumps({"sequence":int(sequence)}))
+    finally: d.close()
+def disable_group_cardkit(data):
+    for item in data.get("group_items",[]):
+        update_interaction(item["interaction_id"],{"feishu_card_id":""})
 def _group_card(d):
     items=[]
     for item in d.get("group_items",[]):
