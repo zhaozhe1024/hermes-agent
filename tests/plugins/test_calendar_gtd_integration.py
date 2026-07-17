@@ -584,6 +584,18 @@ class TestShouldSendCard:
         assert _should_send_card(data) is False
 
 
+def _pa_card_elements(card):
+    return card["body"]["elements"]
+
+
+def _pa_card_buttons(card):
+    return [element for element in _pa_card_elements(card) if element.get("tag") == "button"]
+
+
+def _pa_button_value(button):
+    return button["behaviors"][0]["value"]
+
+
 class TestCardBuilding:
     def test_linked_task_display_survives_followup_cards(self):
         from reminder_card_handler import build_card, build_confirm_card
@@ -603,7 +615,7 @@ class TestCardBuilding:
         )
 
         for card in (initial, followup):
-            content = card["elements"][0]["content"]
+            content = _pa_card_elements(card)[0]["content"]
             assert "**[Test Task](https://notion.so/task)**" in content
             assert "<font color='grey'>*[Important · Work]*</font>" in content
 
@@ -613,28 +625,29 @@ class TestCardBuilding:
                           "2026-01-01T10:00+08:00", "2026-01-01T11:00+08:00",
                           "即将开始")
         # Verify structure
+        assert card["schema"] == "2.0"
         assert card["header"]["title"]["content"] == "即将开始"
-        buttons = card["elements"][1]["actions"]
-        actions = {b["value"]["action"] for b in buttons}
+        buttons = _pa_card_buttons(card)
+        actions = {_pa_button_value(b)["action"] for b in buttons}
         assert "start" in actions
         assert "snooze" in actions
         assert "reschedule" in actions
         assert card["config"]["update_multi"] is True
-        text = card["elements"][0]["content"]
+        text = _pa_card_elements(card)[0]["content"]
         assert "01Jan26 10:00–11:00" in text
         assert "+08:00" not in text
         # All buttons have hermes_action=pa_reminder and interaction_id
         for b in buttons:
-            assert b["value"]["hermes_action"] == "pa_reminder"
-            assert b["value"]["interaction_id"] == "iid-1"
+            assert _pa_button_value(b)["hermes_action"] == "pa_reminder"
+            assert _pa_button_value(b)["interaction_id"] == "iid-1"
 
     def test_completion_card_build(self):
         from reminder_card_handler import build_card
         card = build_card("iid-2", "task.completion", "Test Task",
                           "2026-01-01T10:00+08:00", "2026-01-01T11:00+08:00",
                           "到时确认")
-        buttons = card["elements"][1]["actions"]
-        actions = {b["value"]["action"] for b in buttons}
+        buttons = _pa_card_buttons(card)
+        actions = {_pa_button_value(b)["action"] for b in buttons}
         assert "complete" in actions
         assert "extend" in actions
         assert "reschedule" in actions
@@ -644,8 +657,8 @@ class TestCardBuilding:
         card = build_card("iid-3", "task.snooze", "Snoozed Task",
                           "2026-01-01T10:00+08:00", "2026-01-01T11:00+08:00",
                           "到点提醒")
-        buttons = card["elements"][1]["actions"]
-        actions = {b["value"]["action"] for b in buttons}
+        buttons = _pa_card_buttons(card)
+        actions = {_pa_button_value(b)["action"] for b in buttons}
         assert "snooze" not in actions  # no re-snooze
         assert "start" in actions
         assert "reschedule" in actions
@@ -889,9 +902,9 @@ class TestE2ECardDispatch:
             r = s.dispatch_action("if","confirm","tcf")
         assert r["status"] == "succeeded"
         assert r["replace_card"]["header"]["title"]["content"] == "操作完成"
-        assert "已确认重新安排" in r["replace_card"]["elements"][0]["content"]
-        assert "17Jul26 10:00–10:30" in r["replace_card"]["elements"][0]["content"]
-        assert all(e.get("tag") != "action" for e in r["replace_card"]["elements"])
+        assert "已确认重新安排" in _pa_card_elements(r["replace_card"])[0]["content"]
+        assert "17Jul26 10:00–10:30" in _pa_card_elements(r["replace_card"])[0]["content"]
+        assert not _pa_card_buttons(r["replace_card"])
         assert s.get_interaction("if")["state"] == S_SUCCEEDED
 
     def test_cancel(self, s):
@@ -941,9 +954,10 @@ class TestCustomTimeFlow:
         r = s.dispatch_action("ic1","reschedule_custom","t1")
         assert r["status"] == "choosing_custom"
         assert "card" in r
-        # Verify form structure (JSON 1.0)
+        # Verify JSON 2.0 form structure.
         c = r["card"]
-        forms = [e for e in c["elements"] if e.get("tag") == "form"]
+        assert c["schema"] == "2.0"
+        forms = [e for e in _pa_card_elements(c) if e.get("tag") == "form"]
         assert len(forms) == 1
         f = forms[0]
         assert f.get("name") == "custom_time_form"
@@ -952,9 +966,9 @@ class TestCustomTimeFlow:
         assert names >= {"custom_date", "custom_start_time", "custom_due_time", "custom_time_submit"}
         btn = [el for el in f["elements"] if el.get("tag") == "button" and el.get("name") == "custom_time_submit"]
         assert len(btn) == 1
-        assert btn[0].get("action_type") == "form_submit"
-        assert btn[0].get("complex_interaction") is True
-        assert any(e.get("tag") == "action" for e in c["elements"])
+        assert btn[0].get("form_action_type") == "submit"
+        assert _pa_button_value(btn[0])["action"] == "reschedule_custom_submit"
+        assert _pa_button_value(_pa_card_buttons(c)[0])["action"] == "reschedule_cancel"
         assert s.get_interaction("ic1")["state"] == "choosing_custom"
 
     def test_custom_submit_date_time_passed_to_suggest_slots(self, s):
@@ -997,9 +1011,9 @@ class TestCustomTimeFlow:
                 {"custom_date":"2026-07-15","custom_start_time":"10:00","custom_due_time":"11:00"})
         assert r["status"] == "choose_slot"
         assert r["card"]["header"]["title"]["content"] == "时间冲突"
-        assert "15Jul26 10:00–11:00" in r["card"]["elements"][0]["content"]
-        assert "已被占用" in r["card"]["elements"][0]["content"]
-        assert r["card"]["elements"][1]["actions"][0]["text"]["content"] == "16Jul26 09:00–10:00"
+        assert "15Jul26 10:00–11:00" in _pa_card_elements(r["card"])[0]["content"]
+        assert "已被占用" in _pa_card_elements(r["card"])[0]["content"]
+        assert _pa_card_buttons(r["card"])[0]["text"]["content"] == "16Jul26 09:00–10:00"
         assert s.get_interaction("ic4")["slot_candidates"] == slots
 
     def test_reschedule_cancel_returns_to_slot_pick(self, s):
@@ -1110,7 +1124,7 @@ class TestAdapterDispatch:
         assert uuid_contexts == ["choose_extend:om"]
         assert patched[0]["message_id"] == "om"
         assert patched[0]["card"]["header"]["template"] == "grey"
-        assert all(e.get("tag") != "action" for e in patched[0]["card"]["elements"])
+        assert not _pa_card_buttons(patched[0]["card"])
 
     def test_terminal_result_replaces_confirmation_card(self, s):
         import asyncio

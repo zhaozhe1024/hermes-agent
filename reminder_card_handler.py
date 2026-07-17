@@ -86,11 +86,8 @@ def build_reschedule_card(iid,title,slots,selected=None):
     prompt=(f"你选择的 **{_fmt_slot(*selected)}** 已被占用。\n请选择其他时间：" if selected else "选择新时间：")
     return _card("时间冲突" if selected else "重新安排时间",f"{_task_block(title)}\n{prompt}",btns)
 def build_custom_time_card(iid, title):
-    """Card with JSON 1.0 form: date_picker + time pickers + submit button."""
-    return {
-        "config": {"wide_screen_mode": True, "update_multi": True},
-        "header": {"title": {"content": "自定义时间", "tag": "plain_text"}, "template": "blue"},
-        "elements": [
+    """Card with a JSON 2.0 date/time form."""
+    return _base_card("自定义时间", [
             {
                 "tag": "form",
                 "name": "custom_time_form",
@@ -102,30 +99,31 @@ def build_custom_time_card(iid, title):
                      "required": True, "placeholder": {"tag": "plain_text", "content": "开始时间"}},
                     {"tag": "picker_time", "name": "custom_due_time",
                      "required": True, "placeholder": {"tag": "plain_text", "content": "结束时间"}},
-                    {"tag": "button", "name": "custom_time_submit",
-                     "complex_interaction": True, "action_type": "form_submit",
-                     "text": {"tag": "plain_text", "content": "确认"},
-                     "type": "primary",
-                     "value": {"hermes_action": "pa_reminder",
-                               "interaction_id": iid, "action": "reschedule_custom_submit"}},
+                    _btn("确认", "reschedule_custom_submit", "primary", iid,
+                         name="custom_time_submit", form_action_type="submit"),
                 ],
             },
-            {"tag": "action", "actions": [
-                {"tag": "button", "text": {"tag": "plain_text", "content": "返回推荐时间"},
-                 "type": "danger", "value": {"hermes_action": "pa_reminder",
-                 "interaction_id": iid, "action": "reschedule_cancel"}},
-            ]},
-        ],
-    }
+            _btn("返回推荐时间", "reschedule_cancel", "danger", iid),
+        ])
 def build_confirm_card(iid,title,proposal):
     return _card("确认操作",f"{_task_block(title)}\n{_meta(_fmt_proposal(proposal))}\n确认？",[_btn("确认","confirm","primary",iid),_btn("取消","cancel","danger",iid)])
 def build_status_card(title,heading,message,proposal=None,template="green"):
     when=_fmt_proposal(proposal); timing=f"\n{_meta(f'时间: {when}')}" if when else ""
-    return {"config":{"wide_screen_mode":True,"update_multi":True},"header":{"title":{"content":heading,"tag":"plain_text"},"template":template},"elements":[{"tag":"markdown","content":f"{_task_block(title)}\n{message}{timing}"}]}
+    return _base_card(heading,[{"tag":"markdown","content":f"{_task_block(title)}\n{message}{timing}"}],template)
 def build_consumed_card(title): return build_status_card(title,"已处理","请继续使用最新卡片。",template="grey")
-def _card(h,b,acts): return {"config":{"wide_screen_mode":True,"update_multi":True},"header":{"title":{"content":h,"tag":"plain_text"},"template":"orange" if h=="确认操作" else "blue"},"elements":[{"tag":"markdown","content":b},{"tag":"action","actions":acts}]}
-def _btn(label,action,bt,iid,**x): v={"hermes_action":"pa_reminder","interaction_id":iid,"action":action}; v.update(x); return {"tag":"button","text":{"tag":"plain_text","content":label},"type":bt,"value":v}
-def _err(m): return {"config":{"wide_screen_mode":True},"header":{"title":{"content":"Error","tag":"plain_text"},"template":"red"},"elements":[{"tag":"markdown","content":m}]}
+def _base_card(h,elements,template="blue"):
+    return {"schema":"2.0","config":{"update_multi":True,"width_mode":"fill"},
+            "header":{"title":{"content":h,"tag":"plain_text"},"template":template},
+            "body":{"elements":elements}}
+def _card(h,b,acts): return _base_card(h,[{"tag":"markdown","content":b},*acts],"orange" if h=="确认操作" else "blue")
+def _btn(label,action,bt,iid,name=None,form_action_type=None,**x):
+    v={"hermes_action":"pa_reminder","interaction_id":iid,"action":action}; v.update(x)
+    button={"tag":"button","text":{"tag":"plain_text","content":label},"type":bt,
+            "behaviors":[{"type":"callback","value":v}]}
+    if name: button["name"]=name
+    if form_action_type: button["form_action_type"]=form_action_type
+    return button
+def _err(m): return _base_card("Error",[{"tag":"markdown","content":m}],"red")
 
 # ── Persistence ──
 def persist_interaction(interaction_id=None, idempotency_key=None, reminder_id=None,
