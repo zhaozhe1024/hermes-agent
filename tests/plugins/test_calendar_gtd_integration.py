@@ -673,6 +673,19 @@ class TestCardBuilding:
         assert "start" in actions
         assert "reschedule" in actions
 
+    def test_must_do_card_keeps_each_pending_task_actionable(self):
+        from reminder_card_handler import build_must_do_card
+        card = build_must_do_card([
+            {"interaction_id":"must-1","task_title":"打针"},
+            {"interaction_id":"must-2","task_title":"吃药",
+             "state":"succeeded","result":"completed"},
+        ])
+        values = [_pa_button_value(button) for button in _pa_card_buttons(card)]
+        assert card["header"]["title"]["content"] == "🚨 强力提醒 · 1 项待办"
+        assert {value["action"] for value in values} == {"complete", "must_do_later"}
+        assert {value["interaction_id"] for value in values} == {"must-1"}
+        assert any("已完成" in element.get("content", "") for element in _pa_card_elements(card))
+
 
 class TestInteractionValidation:
     def test_all_fail_closed_no_config(self, tmp_path, monkeypatch):
@@ -828,6 +841,35 @@ class TestE2ECardDispatch:
             m3.return_value = {"success":True,"status":"applied"}
             r = s.dispatch_action("i2","start","t2")
         assert r["status"] == "succeeded"
+
+    def test_must_do_complete_updates_only_the_selected_row(self, s):
+        items = [
+            {"interaction_id":"md1","page_id":"pg1","task_title":"打针"},
+            {"interaction_id":"md2","page_id":"pg2","task_title":"吃药"},
+        ]
+        for item in items:
+            s.persist_interaction(item["interaction_id"],"dk",1,"checkin","must_do",
+                                  "2099-01-01T00:00:00+00:00",item["page_id"],"om","oc",
+                                  ["complete","must_do_later"])
+            s.update_interaction(item["interaction_id"],{"task_title":item["task_title"],"group_items":items})
+        with patch("reminder_card_handler.show_task", return_value={"success":True}),\
+             patch("reminder_card_handler.create_session", return_value={"success":True}),\
+             patch("reminder_card_handler.execute_action", return_value={"success":True,"status":"applied"}):
+            result = s.dispatch_action("md1","complete","tok-md1")
+        values = [_pa_button_value(button) for button in _pa_card_buttons(result["replace_card"])]
+        assert result["status"] == "succeeded"
+        assert s.get_interaction("md1")["result"] == "completed"
+        assert {value["interaction_id"] for value in values} == {"md2"}
+
+    def test_must_do_later_waits_for_the_next_batch(self, s):
+        items = [{"interaction_id":"md3","page_id":"pg3","task_title":"打针"}]
+        s.persist_interaction("md3","dk",1,"checkin","must_do","2099-01-01T00:00:00+00:00",
+                              "pg3","om","oc",["complete","must_do_later"])
+        s.update_interaction("md3",{"task_title":"打针","group_items":items})
+        result = s.dispatch_action("md3","must_do_later","tok-md3")
+        assert result["status"] == "succeeded"
+        assert s.get_interaction("md3")["result"] == "later"
+        assert not _pa_card_buttons(result["replace_card"])
 
     def test_extend_goes_to_choosing_extend(self, s):
         s.persist_interaction("i3","dk",1,"completion","task.completion","2099-01-01T00:00:00+00:00","pg","om","oc",["extend"])

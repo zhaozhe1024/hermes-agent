@@ -78,6 +78,23 @@ def build_card(interaction_id=None, product_command=None, task_title=None,
     if task_due and not task_start: tl=f"完成: {_fmt_point(task_due)}"
     return _card(heading,"\n".join(filter(None,(_task_block(task_title),_meta(tl)))),[_btn(l,a,t,interaction_id) for l,a,t in acts])
 
+def build_must_do_card(items):
+    pending=sum(item.get("state",S_PENDING)!=S_SUCCEEDED for item in items)
+    elements=[]
+    for item in items:
+        state=item.get("state",S_PENDING); result=item.get("result","")
+        status=""
+        if state==S_SUCCEEDED: status="✅ 已完成" if result=="completed" else "⏰ 下一轮再提醒"
+        elif state==S_CONFLICT: status="⚠️ 操作失败，请等待下一轮提醒"
+        elif state in {S_APPLYING,S_AWAITING_CONFIRMATION}: status="⏳ 处理中"
+        elements.append({"tag":"markdown","content":f"{_task_block(item.get('task_title'))}\n{_meta(status)}" if status else _task_block(item.get("task_title"))})
+        if not status:
+            elements.append(_action_row([
+                _btn("标记完成","complete","primary",item["interaction_id"]),
+                _btn("下一轮再提醒","must_do_later","default",item["interaction_id"]),
+            ]))
+    return _base_card(f"🚨 强力提醒 · {pending} 项待办",elements,"red")
+
 def build_extend_card(iid,title): return _card("延长时间",f"{_task_block(title)}\n选择延长时间：",
     [_btn(f"+{m} 分钟","extend_confirm","primary" if m==15 else "default",iid,minutes=m) for m in (15,30,60)])
 def build_reschedule_card(iid,title,slots,selected=None):
@@ -170,6 +187,12 @@ def update_interaction(iid,upd):
     x.update(upd); d=_db()
     try: d.set_meta(_ik(iid),json.dumps(x))
     finally: d.close()
+def _group_card(d):
+    items=[]
+    for item in d.get("group_items",[]):
+        current=get_interaction(item["interaction_id"]) or {}
+        items.append({**item,"state":current.get("state",S_PENDING),"result":current.get("result","")})
+    return build_must_do_card(items)
 
 # ── Atomic CAS ──
 def atomic_claim(iid,token,expected_state,next_state=None):
@@ -202,7 +225,7 @@ def atomic_claim(iid,token,expected_state,next_state=None):
 # ── Validation ──
 _ALL_ACTIONS=frozenset({"start","snooze","reschedule","complete","extend",
     "extend_confirm","reschedule_pick","reschedule_custom",
-    "reschedule_custom_submit","reschedule_cancel","confirm","cancel"})
+    "reschedule_custom_submit","reschedule_cancel","confirm","cancel","must_do_later"})
 _SECONDARY_ACTIONS=frozenset({"extend_confirm","reschedule_pick","reschedule_custom",
     "reschedule_custom_submit","reschedule_cancel","confirm","cancel"})
 _VALID_STATES=frozenset({S_PENDING,S_CHOOSING_EXTEND,S_CHOOSING_SLOT,S_CHOOSING_CUSTOM,S_APPLYING,S_AWAITING_CONFIRMATION})
@@ -310,6 +333,12 @@ def dispatch_action(iid,action,token,params=None):
         update_interaction(iid,{"state":S_CHOOSING_SLOT,"slot_candidates":slots})
         return {"status":"choose_slot","card":build_reschedule_card(iid,d.get("task_title",d["page_id"]),slots,(custom_start,custom_due))}
 
+    if action=="must_do_later":
+        err=atomic_claim(iid,token,S_PENDING,next_state=S_SUCCEEDED)
+        if err: return {"status":err}
+        update_interaction(iid,{"state":S_SUCCEEDED,"result":"later"})
+        return {"status":"succeeded","replace_card":_group_card(d)}
+
     if action in ("start","complete"):
         err=atomic_claim(iid,token,S_PENDING)
         if err: return {"status":err}
@@ -351,13 +380,19 @@ def _do_extend(d,mins):
             return {"status":"failed"}
     return _cx(d,"extend",due=new)
 def _do_reschedule(d,slot): s=show_task(d["page_id"]); return _cx(d,"reschedule",start=slot.get("start"),due=slot.get("due")) if s.get("success") else (update_interaction(d["interaction_id"],{"state":S_CONFLICT}) or {"status":"failed"})
-def _do_task(d,action): s=show_task(d["page_id"]); return _cx(d,action) if s.get("success") else (update_interaction(d["interaction_id"],{"state":S_CONFLICT}) or {"status":"failed"})
+def _do_task(d,action):
+    s=show_task(d["page_id"])
+    if s.get("success"): return _cx(d,action)
+    update_interaction(d["interaction_id"],{"state":S_CONFLICT})
+    return {"status":"failed",**({"replace_card":_group_card(d)} if d.get("group_items") else {})}
 def _cx_from_proposal(d,prop): return _cx(d,"reschedule",start=prop.get("start"),due=prop.get("due"))
 def _cx(d,action,start=None,due=None):
     sid=f"card-{uuid.uuid4().hex[:12]}"
     uid=os.environ.get("FEISHU_ALLOWED_USERS","").split(",")[0].strip()
     r=create_session(sid,d["feishu_chat_id"],uid,d["active_message_id"],d["page_id"],action,start=start,due=due)
-    if not r.get("success"): update_interaction(d["interaction_id"],{"state":S_CONFLICT}); return {"status":"failed"}
+    if not r.get("success"):
+        update_interaction(d["interaction_id"],{"state":S_CONFLICT})
+        return {"status":"failed",**({"replace_card":_group_card(d)} if d.get("group_items") else {})}
     exe=execute_action(sid,feishu_chat_id=d["feishu_chat_id"],feishu_user_id=uid)
     if exe.get("status")=="confirmation_required":
         sess=get_session(sid); ctok=(sess or {}).get("confirmation_token",""); cexp=(sess or {}).get("confirmation_expires_at","")
@@ -365,7 +400,9 @@ def _cx(d,action,start=None,due=None):
         update_interaction(d["interaction_id"],{"state":S_AWAITING_CONFIRMATION,"session_id":sid,"proposal":prop,"pending_action":action,"confirmation_token":ctok,"confirmation_expires_at":cexp})
         return {"status":"confirmation_required","card":build_confirm_card(d["interaction_id"],d.get("task_title",d["page_id"]),prop)}
     if exe.get("success"):
-        update_interaction(d["interaction_id"],{"state":S_SUCCEEDED})
+        update_interaction(d["interaction_id"],{"state":S_SUCCEEDED,**({"result":"completed"} if d.get("group_items") else {})})
+        if d.get("group_items"): return {"status":"succeeded","replace_card":_group_card(d)}
         return {"status":"succeeded","replace_card":build_status_card(
             d.get("task_title",d["page_id"]),"已处理","操作已完成。",template="grey")}
-    update_interaction(d["interaction_id"],{"state":S_CONFLICT}); return {"status":"failed"}
+    update_interaction(d["interaction_id"],{"state":S_CONFLICT})
+    return {"status":"failed",**({"replace_card":_group_card(d)} if d.get("group_items") else {})}
