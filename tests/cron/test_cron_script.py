@@ -171,6 +171,50 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    def test_script_can_reload_trusted_dotenv_after_sanitization(self, cron_env, monkeypatch):
+        """Trusted cron workers can explicitly reload credentials after the spawn boundary."""
+        from cron.scheduler import _run_job_script
+
+        values = {
+            "FEISHU_APP_ID": "dotenv-app-id",
+            "FEISHU_APP_SECRET": "dotenv-app-secret",
+            "FEISHU_HOME_CHANNEL": "oc_dotenv_chat",
+        }
+        for key in values:
+            monkeypatch.setenv(key, f"parent-{key.lower()}")
+        (cron_env / ".env").write_text(
+            "".join(f"{key}={value}\n" for key, value in values.items()),
+            encoding="utf-8",
+        )
+
+        project_root = Path(__file__).resolve().parents[2]
+        script = cron_env / "scripts" / "trusted_env_loader.py"
+        script.write_text(
+            textwrap.dedent(
+                f"""\
+                import json
+                import os
+                import sys
+
+                sys.path.insert(0, {str(project_root)!r})
+                keys = {tuple(values)!r}
+                sanitized = not any(os.environ.get(key) for key in keys)
+
+                from hermes_cli.env_loader import load_hermes_dotenv
+                load_hermes_dotenv(hermes_home=os.environ["HERMES_HOME"])
+
+                expected = {values!r}
+                loaded = all(os.environ.get(key) == value for key, value in expected.items())
+                print(json.dumps({{"sanitized": sanitized, "loaded": loaded}}))
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        success, output = _run_job_script(script.name)
+        assert success is True
+        assert json.loads(output) == {"sanitized": True, "loaded": True}
+
     def test_script_empty_output(self, cron_env):
         from cron.scheduler import _run_job_script
 

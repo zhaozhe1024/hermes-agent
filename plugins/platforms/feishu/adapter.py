@@ -99,6 +99,8 @@ try:
         GetMessageRequest,
         GetMessageResourceRequest,
         P2ImMessageMessageReadV1,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
         UpdateMessageRequest,
@@ -110,6 +112,7 @@ try:
     from lark_oapi.event.callback.model.p2_card_action_trigger import (
         CallBackCard,
         P2CardActionTriggerResponse,
+        CallBackToast,
     )
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     from lark_oapi.ws import Client as FeishuWSClient
@@ -1376,6 +1379,7 @@ def check_feishu_requirements() -> bool:
             CreateMessageRequest, CreateMessageRequestBody,
             GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
             P2ImMessageMessageReadV1,
+            PatchMessageRequest, PatchMessageRequestBody,
             ReplyMessageRequest, ReplyMessageRequestBody,
             UpdateMessageRequest, UpdateMessageRequestBody,
         )
@@ -1383,7 +1387,7 @@ def check_feishu_requirements() -> bool:
         from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
         from lark_oapi.core.model import BaseRequest
         from lark_oapi.event.callback.model.p2_card_action_trigger import (
-            CallBackCard, P2CardActionTriggerResponse,
+            CallBackCard, P2CardActionTriggerResponse, CallBackToast,
         )
         from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
         from lark_oapi.ws import Client as FeishuWSClient
@@ -1400,6 +1404,8 @@ def check_feishu_requirements() -> bool:
             "GetMessageRequest": GetMessageRequest,
             "GetMessageResourceRequest": GetMessageResourceRequest,
             "P2ImMessageMessageReadV1": P2ImMessageMessageReadV1,
+            "PatchMessageRequest": PatchMessageRequest,
+            "PatchMessageRequestBody": PatchMessageRequestBody,
             "ReplyMessageRequest": ReplyMessageRequest,
             "ReplyMessageRequestBody": ReplyMessageRequestBody,
             "UpdateMessageRequest": UpdateMessageRequest,
@@ -1891,7 +1897,12 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a Feishu message."""
+        """Send a Feishu message.
+
+        When *metadata* carries ``idempotency_uuid``, each chunk uses
+        ``uuid.uuid5(base_uuid, str(chunk_index))`` so that multi-chunk
+        deliveries produce distinct but deterministically replayable UUIDs.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -1899,8 +1910,20 @@ class FeishuAdapter(BasePlatformAdapter):
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
 
+        # Resolve base idempotency UUID once for chunk derivation.
+        base_uuid_str = (metadata or {}).get("idempotency_uuid")
+        base_uuid: Optional[uuid.UUID] = None
+        if base_uuid_str is not None:
+            base_uuid = uuid.UUID(base_uuid_str)
+
         try:
-            for chunk in chunks:
+            for chunk_idx, chunk in enumerate(chunks):
+                chunk_metadata = dict(metadata) if metadata else {}
+                if base_uuid is not None:
+                    chunk_metadata["idempotency_uuid"] = str(
+                        uuid.uuid5(base_uuid, str(chunk_idx))
+                    )
+
                 msg_type, payload = self._build_outbound_payload(chunk)
                 try:
                     response = await self._feishu_send_with_retry(
@@ -1908,7 +1931,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type=msg_type,
                         payload=payload,
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=chunk_metadata,
                     )
                 except Exception as exc:
                     if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
@@ -1919,7 +1942,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=chunk_metadata,
                     )
                 if (
                     msg_type == "post"
@@ -1932,7 +1955,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=chunk_metadata,
                     )
                 last_response = response
 
@@ -2652,12 +2675,28 @@ class FeishuAdapter(BasePlatformAdapter):
         event = getattr(data, "event", None)
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
+        # Merge form_value for date/time picker fields
+        form_value = getattr(action, "form_value", None)
+        if form_value:
+            try:
+                fv = json.loads(form_value) if isinstance(form_value, str) else dict(form_value)
+            except (json.JSONDecodeError, TypeError):
+                fv = {}
+            for key in ("custom_date", "custom_start_time", "custom_due_time"):
+                if key in fv and key not in action_value:
+                    action_value[key] = fv[key]
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
         update_prompt_action = (
             action_value.get("hermes_update_prompt_action")
             if isinstance(action_value, dict) else None
         )
 
+        if hermes_action == "pa_reminder":
+            return self._handle_pa_reminder_card_action(
+                event=event,
+                action_value=action_value,
+                loop=loop,
+            )
         if hermes_action:
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
         if update_prompt_action:
@@ -2953,6 +2992,134 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
         await self._handle_message_with_guards(synthetic_event)
+
+    def _handle_pa_reminder_card_action(
+        self, *, event: Any, action_value: Dict[str, Any], loop: Any
+    ) -> Any:
+        from reminder_card_handler import validate_click, dispatch_action, get_interaction
+
+        iid = action_value.get("interaction_id", "")
+        action = action_value.get("action", "")
+        operator = getattr(event, "operator", None)
+        context = getattr(event, "context", None)
+        token = getattr(event, "token", None)
+
+        oid = str(getattr(operator, "open_id", "") or "")
+        chat = str(getattr(context, "open_chat_id", "") or "")
+        mid = str(getattr(context, "open_message_id", "") or "")
+        etok = str(token or "")
+
+        err = validate_click(iid, oid, chat, mid, action, etok)
+        if err:
+            logger.warning("[Feishu] PA card validation: %s", err)
+            return self._make_toast("该操作已处理" if ("closed" in err or "duplicate" in err) else "操作失败")
+
+        params = {k: v for k, v in action_value.items()
+                  if k not in ("hermes_action", "interaction_id", "action")}
+
+        dispatched = self._submit_on_loop(
+            loop,
+            self._dispatch_pa_reminder_action(iid=iid, action=action, etok=etok, params=params),
+        )
+        if not dispatched:
+            logger.error("[Feishu] PA dispatch scheduling failed for %s", iid)
+            return self._make_toast("系统繁忙，请重试")
+        return self._make_toast("已收到，正在处理")
+
+    async def _dispatch_pa_reminder_action(
+        self, *, iid: str, action: str, etok: str, params: dict
+    ) -> None:
+        from reminder_card_handler import build_consumed_card, dispatch_action, get_interaction, update_interaction
+
+        try:
+            before = get_interaction(iid)
+            result = dispatch_action(iid, action, etok, params)
+            status = result.get("status","")
+            logger.info("[Feishu] PA action %s → %s", action, status)
+
+            replacement = result.get("replace_card")
+            if replacement and before:
+                rr = await self._patch_card_message(
+                    message_id=before["active_message_id"], card=replacement,
+                )
+                if not rr.success:
+                    sr = await self._send_card_to_chat(
+                        chat_id=before["feishu_chat_id"], card=replacement,
+                        idempotency_uuid=self._derive_card_uuid(
+                            iid, f"{status}:{before.get('active_message_id', '')}:result"
+                        ),
+                    )
+                    if not sr or not sr.success:
+                        logger.error("[Feishu] Result card delivery failed for %s", iid)
+                return
+
+            card = result.get("card")
+            if card and before:
+                snapshot = {"state": before.get("state"), "active_message_id": before.get("active_message_id")}
+                iuuid = self._derive_card_uuid(
+                    iid, f"{status}:{before.get('active_message_id', '')}"
+                )
+                sr = await self._send_card_to_chat(
+                    chat_id=before["feishu_chat_id"], card=card,
+                    idempotency_uuid=iuuid,
+                )
+                if sr and sr.success:
+                    update_interaction(iid, {"active_message_id": sr.message_id})
+                    rr = await self._patch_card_message(
+                        message_id=before["active_message_id"],
+                        card=build_consumed_card(before.get("task_title", before["page_id"])),
+                    )
+                    if not rr.success:
+                        logger.warning("[Feishu] Old PA card could not be disabled for %s", iid)
+                else:
+                    logger.error("[Feishu] Card delivery failed for %s, restoring", iid)
+                    update_interaction(iid, snapshot)
+        except Exception as exc:
+            logger.error("[Feishu] PA dispatch failed: %s", exc, exc_info=True)
+
+    @staticmethod
+    def _derive_card_uuid(iid: str, context: str) -> str:
+        """Deterministic UUID for idempotent secondary card delivery."""
+        import uuid as _uuid
+        return str(_uuid.uuid5(_uuid.NAMESPACE_OID, f"card:{iid}:{context}"))
+
+    async def _patch_card_message(self, *, message_id: str, card: dict) -> SendResult:
+        """Replace an interactive card so its old actions cannot be reused."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        try:
+            body = PatchMessageRequestBody.builder().content(
+                json.dumps(card, ensure_ascii=False)
+            ).build()
+            request = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
+            response = await self._run_blocking(self._client.im.v1.message.patch, request)
+            result = self._finalize_send_result(response, "card update failed")
+            if result.success:
+                result.message_id = message_id
+            return result
+        except Exception as exc:
+            logger.error("[Feishu] Card update failed for %s: %s", message_id, exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _send_card_to_chat(self, *, chat_id, card,
+                                  idempotency_uuid=None, reply_to=None, metadata=None):
+        try:
+            payload = json.dumps(card, ensure_ascii=False)
+            if idempotency_uuid:
+                metadata = (metadata or {})
+                metadata = {**metadata, "idempotency_uuid": idempotency_uuid}
+            r = await self._feishu_send_with_retry(
+                chat_id=chat_id, msg_type="interactive", payload=payload,
+                reply_to=reply_to, metadata=metadata)
+            return self._finalize_send_result(r, "card send")
+        except Exception as exc:
+            logger.error("[Feishu] Card send failed: %s", exc); return None
+
+    def _make_toast(self, content):
+        if P2CardActionTriggerResponse is None or CallBackToast is None: return None
+        r = P2CardActionTriggerResponse()
+        t = CallBackToast(); t.type = "info"; t.content = content
+        r.toast = t; return r
 
     def _is_card_action_duplicate(self, token: str) -> bool:
         """Return True if this card action token was already processed within the dedup window."""
@@ -4614,12 +4781,26 @@ class FeishuAdapter(BasePlatformAdapter):
         if not effective_reply_to and metadata and metadata.get("thread_id"):
             effective_reply_to = metadata.get("reply_to_message_id")
         reply_in_thread = bool((metadata or {}).get("thread_id"))
+
+        # Resolve idempotency UUID from metadata. Validated with uuid.UUID();
+        # invalid values raise (fail closed), absent values fall through to
+        # uuid4() in each branch for backward compatibility.
+        idem_uuid_str = (metadata or {}).get("idempotency_uuid")
+        idem_uuid: Optional[str] = None
+        if idem_uuid_str is not None:
+            try:
+                idem_uuid = str(uuid.UUID(idem_uuid_str))
+            except (ValueError, AttributeError):
+                raise ValueError(
+                    f"Feishu idempotency_uuid must be a valid UUID string, got: {idem_uuid_str!r}"
+                ) from None
+
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
                 msg_type=msg_type,
                 reply_in_thread=reply_in_thread,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=idem_uuid or str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
@@ -4633,7 +4814,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 receive_id=_thread_id,
                 msg_type=msg_type,
                 content=payload,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=idem_uuid or str(uuid.uuid4()),
             )
             request = self._build_create_message_request("thread_id", body)
         else:
@@ -4649,7 +4830,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 receive_id=receive_id,
                 msg_type=msg_type,
                 content=payload,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=idem_uuid or str(uuid.uuid4()),
             )
             request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)
@@ -4731,7 +4912,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_client = FeishuWSClient(
             app_id=self._app_id,
             app_secret=self._app_secret,
-            log_level=lark.LogLevel.INFO,
+            log_level=lark.LogLevel.WARNING,
             event_handler=self._event_handler,
             domain=domain,
             # Channel SDK signaling tag: without this UA tag the Feishu
@@ -5402,13 +5583,20 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    idempotency_uuid=None,
+    card=None,
 ):
     """Out-of-process Feishu/Lark delivery via the adapter's send pipeline.
 
     Implements the standalone_sender_fn contract so deliver=feishu cron jobs
     succeed when cron runs separately from the gateway. Builds a transient
     FeishuAdapter, hydrates its lark client, and sends text + native media
-    (images, video, voice, documents). Replaces the legacy _send_feishu helper.
+    (images, video, voice, documents) or an interactive card.
+
+    *idempotency_uuid* (optional): a stable UUID for client-side idempotency.
+    *card* (optional): an interactive card dict. When provided, sent as
+    ``msg_type=\"interactive\"`` with JSON payload. Mutually exclusive with
+    *message* (card takes precedence when both are present).
     """
     if not FEISHU_AVAILABLE:
         return {"error": "Feishu dependencies not installed. Run: pip install 'hermes-agent[feishu]'"}
@@ -5419,10 +5607,29 @@ async def _standalone_send(
         domain_name = getattr(adapter, "_domain_name", "feishu")
         domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
         adapter._client = adapter._build_lark_client(domain)
-        metadata = {"thread_id": thread_id} if thread_id else None
+        metadata = {"thread_id": thread_id} if thread_id else {}
+        if idempotency_uuid is not None:
+            metadata["idempotency_uuid"] = idempotency_uuid
+        if not metadata:
+            metadata = None
 
         last_result = None
-        if message.strip():
+
+        # Card takes precedence over message
+        if card is not None:
+            payload = json.dumps(card, ensure_ascii=False)
+            response = await adapter._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=None,
+                metadata=metadata,
+            )
+            last_result = adapter._finalize_send_result(response, "card send failed")
+            if not last_result.success:
+                return {"error": f"Feishu card send failed: {last_result.error}"}
+
+        elif message.strip():
             last_result = await adapter.send(chat_id, message, metadata=metadata)
             if not last_result.success:
                 return {"error": f"Feishu send failed: {last_result.error}"}
