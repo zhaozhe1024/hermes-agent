@@ -131,7 +131,7 @@ def _err(m): return {"config":{"wide_screen_mode":True},"header":{"title":{"cont
 def persist_interaction(interaction_id=None, idempotency_key=None, reminder_id=None,
                         kind=None, product_command=None, expires_at=None, page_id=None,
                         feishu_message_id=None, feishu_chat_id=None, allowed_actions=None,
-                        task_title=None, *args):
+                        task_title=None, snooze_expires_at=None, *args):
     if args or interaction_id is None:
         vals=[interaction_id,idempotency_key,reminder_id,kind,product_command,
               expires_at,page_id,feishu_message_id,feishu_chat_id,allowed_actions]
@@ -149,6 +149,7 @@ def persist_interaction(interaction_id=None, idempotency_key=None, reminder_id=N
     data={"interaction_id":interaction_id,"delivery_idempotency_key":idempotency_key,
           "reminder_id":reminder_id,"kind":kind,"product_command":product_command,
           "expires_at":expires_at,"page_id":page_id,
+          "snooze_expires_at":snooze_expires_at,
           "active_message_id":feishu_message_id,"feishu_chat_id":feishu_chat_id,
           "allowed_actions":allowed_actions,"task_title":task_title or page_id,
           "state":S_PENDING,"created_at":datetime.now(timezone.utc).isoformat()}
@@ -216,7 +217,8 @@ def validate_click(iid,oid,chat,mid,action,token):
     if action not in _ALL_ACTIONS: return f"action not allowed: {action}"
     if action not in d.get("allowed_actions",[]) and action not in _SECONDARY_ACTIONS:
         return f"action not allowed for this interaction: {action}"
-    ex=d.get("expires_at")
+    ex=d.get("snooze_expires_at") if action=="snooze" else d.get("expires_at")
+    ex=ex or d.get("expires_at")
     if ex:
         try:
             if datetime.now(timezone.utc)>datetime.fromisoformat(ex): return "expired"
@@ -360,5 +362,8 @@ def _cx(d,action,start=None,due=None):
         prop=exe.get("proposal",sess.get("proposal",{}) if sess else {})
         update_interaction(d["interaction_id"],{"state":S_AWAITING_CONFIRMATION,"session_id":sid,"proposal":prop,"pending_action":action,"confirmation_token":ctok,"confirmation_expires_at":cexp})
         return {"status":"confirmation_required","card":build_confirm_card(d["interaction_id"],d.get("task_title",d["page_id"]),prop)}
-    if exe.get("success"): update_interaction(d["interaction_id"],{"state":S_SUCCEEDED}); return {"status":"succeeded"}
+    if exe.get("success"):
+        update_interaction(d["interaction_id"],{"state":S_SUCCEEDED})
+        return {"status":"succeeded","replace_card":build_status_card(
+            d.get("task_title",d["page_id"]),"已处理","操作已完成。",template="grey")}
     update_interaction(d["interaction_id"],{"state":S_CONFLICT}); return {"status":"failed"}
