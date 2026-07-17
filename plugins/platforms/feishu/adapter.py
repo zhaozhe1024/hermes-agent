@@ -3029,10 +3029,25 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _dispatch_pa_reminder_action(
         self, *, iid: str, action: str, etok: str, params: dict
     ) -> None:
-        from reminder_card_handler import build_consumed_card, dispatch_action, get_interaction, update_interaction
+        from reminder_card_handler import (
+            build_consumed_card,
+            build_processing_card,
+            build_status_card,
+            dispatch_action,
+            get_interaction,
+            update_interaction,
+        )
 
+        before = None
         try:
             before = get_interaction(iid)
+            if before:
+                rr = await self._patch_card_message(
+                    message_id=before["active_message_id"],
+                    card=build_processing_card(before.get("task_title", before["page_id"])),
+                )
+                if not rr.success:
+                    logger.warning("[Feishu] PA processing card update failed for %s", iid)
             result = dispatch_action(iid, action, etok, params)
             status = result.get("status","")
             logger.info("[Feishu] PA action %s → %s", action, status)
@@ -3074,8 +3089,36 @@ class FeishuAdapter(BasePlatformAdapter):
                 else:
                     logger.error("[Feishu] Card delivery failed for %s, restoring", iid)
                     update_interaction(iid, snapshot)
+                    await self._patch_card_message(
+                        message_id=before["active_message_id"],
+                        card=build_status_card(
+                            before.get("task_title", before["page_id"]),
+                            "操作失败", "未能打开下一步卡片，请稍后重试。", template="red",
+                        ),
+                    )
+                return
+
+            if before:
+                ok = status == "succeeded"
+                await self._patch_card_message(
+                    message_id=before["active_message_id"],
+                    card=build_status_card(
+                        before.get("task_title", before["page_id"]),
+                        "已处理" if ok else "操作失败",
+                        "操作已完成。" if ok else "未能完成操作，请稍后重试。",
+                        template="grey" if ok else "red",
+                    ),
+                )
         except Exception as exc:
             logger.error("[Feishu] PA dispatch failed: %s", exc, exc_info=True)
+            if before:
+                await self._patch_card_message(
+                    message_id=before["active_message_id"],
+                    card=build_status_card(
+                        before.get("task_title", before["page_id"]),
+                        "操作失败", "未能完成操作，请稍后重试。", template="red",
+                    ),
+                )
 
     @staticmethod
     def _derive_card_uuid(iid: str, context: str) -> str:

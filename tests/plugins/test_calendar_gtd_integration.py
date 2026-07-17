@@ -589,7 +589,16 @@ def _pa_card_elements(card):
 
 
 def _pa_card_buttons(card):
-    return [element for element in _pa_card_elements(card) if element.get("tag") == "button"]
+    def walk(value):
+        if isinstance(value, dict):
+            if value.get("tag") == "button":
+                yield value
+            for child in value.values():
+                yield from walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from walk(child)
+    return list(walk(card))
 
 
 def _pa_button_value(button):
@@ -633,6 +642,7 @@ class TestCardBuilding:
         assert "snooze" in actions
         assert "reschedule" in actions
         assert card["config"]["update_multi"] is True
+        assert _pa_card_elements(card)[1]["flex_mode"] == "flow"
         text = _pa_card_elements(card)[0]["content"]
         assert "01Jan26 10:00–11:00" in text
         assert "+08:00" not in text
@@ -968,7 +978,9 @@ class TestCustomTimeFlow:
         assert len(btn) == 1
         assert btn[0].get("form_action_type") == "submit"
         assert _pa_button_value(btn[0])["action"] == "reschedule_custom_submit"
-        assert _pa_button_value(_pa_card_buttons(c)[0])["action"] == "reschedule_cancel"
+        assert "reschedule_cancel" in {
+            _pa_button_value(button)["action"] for button in _pa_card_buttons(c)
+        }
         assert s.get_interaction("ic1")["state"] == "choosing_custom"
 
     def test_custom_submit_date_time_passed_to_suggest_slots(self, s):
@@ -1123,8 +1135,9 @@ class TestAdapterDispatch:
         assert d["active_message_id"] == "new-msg-id"
         assert uuid_contexts == ["choose_extend:om"]
         assert patched[0]["message_id"] == "om"
-        assert patched[0]["card"]["header"]["template"] == "grey"
-        assert not _pa_card_buttons(patched[0]["card"])
+        assert patched[0]["card"]["header"]["title"]["content"] == "处理中"
+        assert patched[1]["card"]["header"]["template"] == "grey"
+        assert not _pa_card_buttons(patched[1]["card"])
 
     def test_terminal_result_replaces_confirmation_card(self, s):
         import asyncio
@@ -1141,7 +1154,8 @@ class TestAdapterDispatch:
              patch.object(adapter, "_patch_card_message", new=fake_patch):
             asyncio.run(adapter._dispatch_pa_reminder_action(iid="iat",action="confirm",etok="t",params={}))
         assert patched[0]["message_id"] == "om-confirm"
-        assert patched[0]["card"]["header"]["title"]["content"] == "操作完成"
+        assert patched[0]["card"]["header"]["title"]["content"] == "处理中"
+        assert patched[1]["card"]["header"]["title"]["content"] == "操作完成"
 
     def test_patch_card_uses_official_message_patch(self):
         import asyncio
@@ -1170,7 +1184,10 @@ class TestAdapterDispatch:
 
         # 1st attempt: send fails
         async def fake_fail(**kw): return None
-        with patch.object(adapter, "_send_card_to_chat", new=fake_fail):
+        class PR: success=True
+        async def fake_patch(**kw): return PR()
+        with patch.object(adapter, "_send_card_to_chat", new=fake_fail),\
+             patch.object(adapter, "_patch_card_message", new=fake_patch):
             async def run(): await adapter._dispatch_pa_reminder_action(iid="iadf",action="extend",etok="tx",params={})
             import asyncio
             loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
@@ -1183,7 +1200,8 @@ class TestAdapterDispatch:
         # 2nd attempt with new token: send succeeds
         class FR: success=True; message_id="new-ok"
         async def fake_ok(**kw): return FR()
-        with patch.object(adapter, "_send_card_to_chat", new=fake_ok):
+        with patch.object(adapter, "_send_card_to_chat", new=fake_ok),\
+             patch.object(adapter, "_patch_card_message", new=fake_patch):
             async def run(): await adapter._dispatch_pa_reminder_action(iid="iadf",action="extend",etok="ty",params={})
             loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
             loop.run_until_complete(run()); loop.close()

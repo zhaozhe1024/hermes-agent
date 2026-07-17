@@ -103,19 +103,23 @@ def build_custom_time_card(iid, title):
                          name="custom_time_submit", form_action_type="submit"),
                 ],
             },
-            _btn("返回推荐时间", "reschedule_cancel", "danger", iid),
+            _action_row([_btn("返回推荐时间", "reschedule_cancel", "danger", iid)]),
         ])
 def build_confirm_card(iid,title,proposal):
     return _card("确认操作",f"{_task_block(title)}\n{_meta(_fmt_proposal(proposal))}\n确认？",[_btn("确认","confirm","primary",iid),_btn("取消","cancel","danger",iid)])
 def build_status_card(title,heading,message,proposal=None,template="green"):
     when=_fmt_proposal(proposal); timing=f"\n{_meta(f'时间: {when}')}" if when else ""
     return _base_card(heading,[{"tag":"markdown","content":f"{_task_block(title)}\n{message}{timing}"}],template)
+def build_processing_card(title): return build_status_card(title,"处理中","正在处理，请稍候。",template="blue")
 def build_consumed_card(title): return build_status_card(title,"已处理","请继续使用最新卡片。",template="grey")
 def _base_card(h,elements,template="blue"):
     return {"schema":"2.0","config":{"update_multi":True,"width_mode":"fill"},
             "header":{"title":{"content":h,"tag":"plain_text"},"template":template},
-            "body":{"elements":elements}}
-def _card(h,b,acts): return _base_card(h,[{"tag":"markdown","content":b},*acts],"orange" if h=="确认操作" else "blue")
+            "body":{"direction":"vertical","vertical_spacing":"8px","elements":elements}}
+def _action_row(acts):
+    return {"tag":"column_set","flex_mode":"flow","horizontal_spacing":"8px",
+            "columns":[{"tag":"column","width":"auto","elements":[act]} for act in acts]}
+def _card(h,b,acts): return _base_card(h,[{"tag":"markdown","content":b},_action_row(acts)],"orange" if h=="确认操作" else "blue")
 def _btn(label,action,bt,iid,name=None,form_action_type=None,**x):
     v={"hermes_action":"pa_reminder","interaction_id":iid,"action":action}; v.update(x)
     button={"tag":"button","text":{"tag":"plain_text","content":label},"type":bt,
