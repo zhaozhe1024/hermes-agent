@@ -89,6 +89,29 @@ class TestAdapterChunkUUID:
         from plugins.platforms.feishu.adapter import _standalone_send
         import inspect
         assert "idempotency_uuid" in inspect.signature(_standalone_send).parameters
+        assert "cardkit" in inspect.signature(_standalone_send).parameters
+
+    def test_standalone_cardkit_sends_card_entity_reference(self):
+        from plugins.platforms.feishu.adapter import FeishuAdapter, SendResult, _standalone_send
+        from gateway.config import PlatformConfig
+
+        sent = []
+        async def fake_create(self, card): return "7371713483664506900"
+        async def fake_send(self, **kwargs): sent.append(kwargs); return object()
+
+        with patch.object(FeishuAdapter, "_build_lark_client", return_value=object()),\
+             patch.object(FeishuAdapter, "_create_card_entity", new=fake_create),\
+             patch.object(FeishuAdapter, "_feishu_send_with_retry", new=fake_send),\
+             patch.object(FeishuAdapter, "_finalize_send_result", return_value=SendResult(success=True,message_id="om-card")):
+            result = asyncio.run(_standalone_send(
+                PlatformConfig(enabled=True, extra={}), "oc_frank", "",
+                card={"schema":"2.0"}, cardkit=True,
+            ))
+
+        assert result["card_id"] == "7371713483664506900"
+        assert json.loads(sent[0]["payload"]) == {
+            "type":"card", "data":{"card_id":"7371713483664506900"},
+        }
 
     @patch("plugins.platforms.feishu.adapter.FeishuAdapter._build_lark_client")
     @patch("plugins.platforms.feishu.adapter.FeishuAdapter._run_blocking")
@@ -681,7 +704,10 @@ class TestCardBuilding:
              "state":"succeeded","result":"completed"},
         ])
         values = [_pa_button_value(button) for button in _pa_card_buttons(card)]
-        assert card["header"]["title"]["content"] == "🚨 强力提醒 · 1 项待办"
+        assert card["header"]["title"]["content"] == "🚨 强力提醒"
+        assert card["config"]["streaming_mode"] is True
+        assert _pa_card_elements(card)[0]["element_id"] == "must_summary"
+        assert "1 项" in _pa_card_elements(card)[0]["content"]
         assert {value["action"] for value in values} == {"complete", "must_do_later"}
         assert {value["interaction_id"] for value in values} == {"must-1"}
         assert any("已完成" in element.get("content", "") for element in _pa_card_elements(card))
@@ -1181,6 +1207,54 @@ class TestAdapterDispatch:
         assert patched[1]["card"]["header"]["template"] == "grey"
         assert not _pa_card_buttons(patched[1]["card"])
 
+    def test_cardkit_must_do_updates_only_selected_row_and_streams(self, s):
+        import asyncio
+        import plugins.platforms.feishu.adapter as adp
+
+        adapter = object.__new__(adp.FeishuAdapter)
+        items = [
+            {"interaction_id":"mdk1","page_id":"pg1","task_title":"打针","cardkit_element_key":"m1"},
+            {"interaction_id":"mdk2","page_id":"pg2","task_title":"吃药","cardkit_element_key":"m2"},
+        ]
+        for item in items:
+            s.persist_interaction(
+                item["interaction_id"], "dk", 1, "checkin", "must_do",
+                "2099-01-01T00:00:00+00:00", item["page_id"], "om-group", "oc_frank",
+                ["complete", "must_do_later"], task_title=item["task_title"],
+                feishu_card_id="7371713483664506900",
+                cardkit_element_key=item["cardkit_element_key"],
+            )
+            s.update_interaction(item["interaction_id"], {"group_items":items})
+
+        batches = []
+        streams = []
+        patched = []
+        class FR: success=True; error=None
+        async def fake_batch(**kwargs): batches.append(kwargs); return FR()
+        async def fake_stream(**kwargs): streams.append(kwargs); return FR()
+        async def fake_patch(**kwargs): patched.append(kwargs); return FR()
+
+        with patch("reminder_card_handler.show_task", return_value={"success":True}),\
+             patch("reminder_card_handler.create_session", return_value={"success":True}),\
+             patch("reminder_card_handler.execute_action", return_value={"success":True,"status":"applied"}),\
+             patch.object(adapter, "_cardkit_batch_update", new=fake_batch),\
+             patch.object(adapter, "_cardkit_stream_text", new=fake_stream),\
+             patch.object(adapter, "_patch_card_message", new=fake_patch):
+            asyncio.run(adapter._dispatch_pa_reminder_action(
+                iid="mdk1", action="complete", etok="token-1", params={},
+            ))
+
+        processing_ids = {action["params"]["element_id"] for action in batches[0]["actions"]}
+        result_ids = {action["params"]["element_id"] for action in batches[1]["actions"]}
+        assert processing_ids == {"m1_text", "m1_actions"}
+        assert result_ids == {"must_summary", "m1_text", "m1_actions"}
+        assert streams[0]["element_id"] == "m1_text"
+        assert "正在处理" in streams[0]["content"]
+        assert "m2_text" not in result_ids and "m2_actions" not in result_ids
+        assert not patched
+        assert s.get_interaction("mdk1")["state"] == "succeeded"
+        assert s.get_interaction("mdk2")["state"] == "pending"
+
     def test_terminal_result_replaces_confirmation_card(self, s):
         import asyncio
         import plugins.platforms.feishu.adapter as adp
@@ -1215,6 +1289,40 @@ class TestAdapterDispatch:
         result = asyncio.run(adapter._patch_card_message(message_id="om-card",card=card))
         assert result.success and requests[0].message_id == "om-card"
         assert json.loads(requests[0].request_body.content) == card
+
+    def test_cardkit_mutations_share_strictly_increasing_sequence(self, s):
+        import asyncio
+        from types import SimpleNamespace
+        import plugins.platforms.feishu.adapter as adp
+
+        adapter = object.__new__(adp.FeishuAdapter)
+        calls = []
+        async def fake_run(fn, request):
+            calls.append(request)
+            return SimpleNamespace(success=lambda: True, code=0, data=SimpleNamespace())
+        adapter._run_blocking = fake_run
+        adapter._client = SimpleNamespace(cardkit=SimpleNamespace(v1=SimpleNamespace(
+            card=SimpleNamespace(batch_update=object()),
+            card_element=SimpleNamespace(content=object()),
+        )))
+
+        async def run():
+            first = await adapter._cardkit_batch_update(
+                card_id="7371713483664506900",
+                actions=[{"action":"partial_update_element","params":{"element_id":"m1_text","partial_element":{"content":"x"}}}],
+                update_uuid="uuid-1",
+            )
+            second = await adapter._cardkit_stream_text(
+                card_id="7371713483664506900", element_id="m1_text",
+                content="xy", update_uuid="uuid-2",
+            )
+            return first, second
+
+        first, second = asyncio.run(run())
+        assert first.success and second.success
+        assert [request.request_body.sequence for request in calls] == [1, 2]
+        assert json.loads(calls[0].request_body.actions)[0]["params"]["element_id"] == "m1_text"
+        assert s.get_cardkit_sequence("7371713483664506900") == 2
 
     def test_real_dispatch_failure_restores_then_retry_succeeds(self, s):
         """First extend: send fails → back to pending. Second extend: send succeeds → choosing_extend."""

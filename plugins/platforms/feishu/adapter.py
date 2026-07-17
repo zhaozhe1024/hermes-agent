@@ -88,6 +88,14 @@ except ImportError:
 try:
     import lark_oapi as lark
     from lark_oapi.api.application.v6 import GetApplicationRequest
+    from lark_oapi.api.cardkit.v1 import (
+        BatchUpdateCardRequest,
+        BatchUpdateCardRequestBody,
+        ContentCardElementRequest,
+        ContentCardElementRequestBody,
+        CreateCardRequest,
+        CreateCardRequestBody,
+    )
     from lark_oapi.api.im.v1 import (
         CreateFileRequest,
         CreateFileRequestBody,
@@ -1475,6 +1483,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
+        # ponytail: one lock is enough for today's PA volume; use per-card locks if throughput matters.
+        self._pa_cardkit_lock = asyncio.Lock()
         # Inbound events that arrived before the adapter loop was ready
         # (e.g. during startup/restart or network-flap reconnect). A single
         # drainer thread replays them as soon as the loop becomes available.
@@ -3039,9 +3049,23 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
         before = None
+        use_cardkit = False
         try:
             before = get_interaction(iid)
-            if before:
+            use_cardkit = bool(
+                before
+                and before.get("product_command") == "must_do"
+                and before.get("feishu_card_id")
+                and before.get("cardkit_element_key")
+            )
+            if use_cardkit:
+                await self._begin_must_do_cardkit(before, etok)
+                if before.get("active_message_id") != before.get("group_message_id"):
+                    await self._patch_card_message(
+                        message_id=before["active_message_id"],
+                        card=build_processing_card(before.get("task_title", before["page_id"])),
+                    )
+            elif before:
                 rr = await self._patch_card_message(
                     message_id=before["active_message_id"],
                     card=build_processing_card(before.get("task_title", before["page_id"])),
@@ -3051,6 +3075,39 @@ class FeishuAdapter(BasePlatformAdapter):
             result = dispatch_action(iid, action, etok, params)
             status = result.get("status","")
             logger.info("[Feishu] PA action %s → %s", action, status)
+
+            if use_cardkit and before:
+                card = result.get("card")
+                if card:
+                    snapshot = {
+                        "state": before.get("state"),
+                        "active_message_id": before.get("active_message_id"),
+                    }
+                    sr = await self._send_card_to_chat(
+                        chat_id=before["feishu_chat_id"], card=card,
+                        idempotency_uuid=self._derive_card_uuid(
+                            iid, f"{status}:{before.get('active_message_id', '')}"
+                        ),
+                    )
+                    if sr and sr.success:
+                        update_interaction(iid, {"active_message_id": sr.message_id})
+                    else:
+                        update_interaction(iid, snapshot)
+                        await self._finish_must_do_cardkit(before, etok, "restore")
+                    return
+
+                await self._finish_must_do_cardkit(before, etok, status)
+                if before.get("active_message_id") != before.get("group_message_id"):
+                    replacement = result.get("replace_card") or build_status_card(
+                        before.get("task_title", before["page_id"]),
+                        "已处理" if status == "succeeded" else "操作失败",
+                        "操作已完成。" if status == "succeeded" else "未能完成操作，请稍后重试。",
+                        template="grey" if status == "succeeded" else "red",
+                    )
+                    await self._patch_card_message(
+                        message_id=before["active_message_id"], card=replacement,
+                    )
+                return
 
             replacement = result.get("replace_card")
             if replacement and before:
@@ -3112,19 +3169,169 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] PA dispatch failed: %s", exc, exc_info=True)
             if before:
-                await self._patch_card_message(
-                    message_id=before["active_message_id"],
-                    card=build_status_card(
-                        before.get("task_title", before["page_id"]),
-                        "操作失败", "未能完成操作，请稍后重试。", template="red",
-                    ),
-                )
+                if use_cardkit:
+                    update_interaction(iid, {"state": "conflict"})
+                    await self._finish_must_do_cardkit(before, etok, "exception")
+                else:
+                    await self._patch_card_message(
+                        message_id=before["active_message_id"],
+                        card=build_status_card(
+                            before.get("task_title", before["page_id"]),
+                            "操作失败", "未能完成操作，请稍后重试。", template="red",
+                        ),
+                    )
+
+    async def _begin_must_do_cardkit(self, data: dict, etok: str) -> None:
+        from reminder_card_handler import build_must_do_cardkit_processing
+
+        update = build_must_do_cardkit_processing(data)
+        result = await self._cardkit_batch_update(
+            card_id=data["feishu_card_id"],
+            actions=update["actions"],
+            update_uuid=self._derive_card_uuid(data["interaction_id"], f"{etok}:processing"),
+        )
+        if not result.success:
+            logger.warning("[Feishu] Must Do row could not enter processing state: %s", result.error)
+            return
+        result = await self._cardkit_stream_text(
+            card_id=data["feishu_card_id"],
+            element_id=update["element_id"],
+            content=update["content"],
+            update_uuid=self._derive_card_uuid(data["interaction_id"], f"{etok}:stream"),
+        )
+        if not result.success:
+            logger.warning("[Feishu] Must Do processing text could not stream: %s", result.error)
+
+    async def _finish_must_do_cardkit(self, data: dict, etok: str, status: str) -> None:
+        from reminder_card_handler import (
+            build_must_do_cardkit_result,
+            disable_group_cardkit,
+        )
+
+        update = build_must_do_cardkit_result(data)
+        result = await self._cardkit_batch_update(
+            card_id=data["feishu_card_id"],
+            actions=update["actions"],
+            update_uuid=self._derive_card_uuid(data["interaction_id"], f"{etok}:{status}:result"),
+        )
+        if result.success:
+            return
+        logger.warning("[Feishu] Must Do CardKit result update failed; using full-card fallback: %s", result.error)
+        disable_group_cardkit(data)
+        await self._patch_card_message(
+            message_id=data.get("group_message_id") or data["active_message_id"],
+            card=update["fallback_card"],
+        )
 
     @staticmethod
     def _derive_card_uuid(iid: str, context: str) -> str:
         """Deterministic UUID for idempotent secondary card delivery."""
         import uuid as _uuid
         return str(_uuid.uuid5(_uuid.NAMESPACE_OID, f"card:{iid}:{context}"))
+
+    async def _create_card_entity(self, card: dict) -> Optional[str]:
+        if not self._client:
+            return None
+        try:
+            body = (
+                CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(json.dumps(card, ensure_ascii=False))
+                .build()
+            )
+            request = CreateCardRequest.builder().request_body(body).build()
+            response = await self._run_blocking(self._client.cardkit.v1.card.create, request)
+            if not self._response_succeeded(response):
+                error = self._response_error_result(response, default_message="card entity create failed")
+                logger.warning("[Feishu] CardKit entity creation failed: %s", error.error)
+                return None
+            return str(getattr(getattr(response, "data", None), "card_id", "") or "") or None
+        except Exception as exc:
+            logger.warning("[Feishu] CardKit entity creation failed: %s", exc)
+            return None
+
+    async def _run_cardkit_mutation(
+        self, *, card_id: str, request_factory: Any, sdk_call: Any, label: str
+    ) -> SendResult:
+        from reminder_card_handler import get_cardkit_sequence, set_cardkit_sequence
+
+        lock = getattr(self, "_pa_cardkit_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._pa_cardkit_lock = lock
+        async with lock:
+            sequence = get_cardkit_sequence(card_id) + 1
+            request = request_factory(sequence)
+            for attempt in range(3):
+                try:
+                    response = await self._run_blocking(sdk_call, request)
+                except Exception as exc:
+                    return SendResult(success=False, error=str(exc))
+                if self._response_succeeded(response):
+                    set_cardkit_sequence(card_id, sequence)
+                    return SendResult(success=True, raw_response=response)
+                if getattr(response, "code", None) == 200810 and attempt < 2:
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                    continue
+                return self._response_error_result(response, default_message=label)
+        return SendResult(success=False, error=label)
+
+    async def _cardkit_batch_update(
+        self, *, card_id: str, actions: list, update_uuid: str
+    ) -> SendResult:
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        def request_factory(sequence: int) -> Any:
+            body = (
+                BatchUpdateCardRequestBody.builder()
+                .uuid(update_uuid)
+                .sequence(sequence)
+                .actions(json.dumps(actions, ensure_ascii=False))
+                .build()
+            )
+            return (
+                BatchUpdateCardRequest.builder()
+                .card_id(card_id)
+                .request_body(body)
+                .build()
+            )
+
+        return await self._run_cardkit_mutation(
+            card_id=card_id,
+            request_factory=request_factory,
+            sdk_call=self._client.cardkit.v1.card.batch_update,
+            label="card batch update failed",
+        )
+
+    async def _cardkit_stream_text(
+        self, *, card_id: str, element_id: str, content: str, update_uuid: str
+    ) -> SendResult:
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        def request_factory(sequence: int) -> Any:
+            body = (
+                ContentCardElementRequestBody.builder()
+                .uuid(update_uuid)
+                .content(content)
+                .sequence(sequence)
+                .build()
+            )
+            return (
+                ContentCardElementRequest.builder()
+                .card_id(card_id)
+                .element_id(element_id)
+                .request_body(body)
+                .build()
+            )
+
+        return await self._run_cardkit_mutation(
+            card_id=card_id,
+            request_factory=request_factory,
+            sdk_call=self._client.cardkit.v1.card_element.content,
+            label="card text stream failed",
+        )
 
     async def _patch_card_message(self, *, message_id: str, card: dict) -> SendResult:
         """Replace an interactive card so its old actions cannot be reused."""
@@ -5628,6 +5835,7 @@ async def _standalone_send(
     force_document=False,
     idempotency_uuid=None,
     card=None,
+    cardkit=False,
 ):
     """Out-of-process Feishu/Lark delivery via the adapter's send pipeline.
 
@@ -5640,6 +5848,7 @@ async def _standalone_send(
     *card* (optional): an interactive card dict. When provided, sent as
     ``msg_type=\"interactive\"`` with JSON payload. Mutually exclusive with
     *message* (card takes precedence when both are present).
+    *cardkit* creates and sends a CardKit entity for component-level updates.
     """
     if not FEISHU_AVAILABLE:
         return {"error": "Feishu dependencies not installed. Run: pip install 'hermes-agent[feishu]'"}
@@ -5659,8 +5868,15 @@ async def _standalone_send(
         last_result = None
 
         # Card takes precedence over message
+        card_id = None
         if card is not None:
-            payload = json.dumps(card, ensure_ascii=False)
+            if cardkit:
+                card_id = await adapter._create_card_entity(card)
+            payload_data = (
+                {"type": "card", "data": {"card_id": card_id}}
+                if card_id else card
+            )
+            payload = json.dumps(payload_data, ensure_ascii=False)
             response = await adapter._feishu_send_with_retry(
                 chat_id=chat_id,
                 msg_type="interactive",
@@ -5696,12 +5912,15 @@ async def _standalone_send(
 
         if last_result is None:
             return {"error": "No deliverable text or media remained after processing MEDIA tags"}
-        return {
+        result = {
             "success": True,
             "platform": "feishu",
             "chat_id": chat_id,
             "message_id": last_result.message_id,
         }
+        if card_id:
+            result["card_id"] = card_id
+        return result
     except Exception as e:
         return {"error": f"Feishu send failed: {e}"}
 
