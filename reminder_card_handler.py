@@ -53,6 +53,10 @@ def _fmt_proposal(proposal):
     return ""
 
 # ── Cards ──
+def _task_block(title):
+    title=str(title or "")
+    return title if title.startswith("**") else f"**{title}**"
+def _meta(value): return f"<font color='grey'>*[{value}]*</font>" if value else ""
 def build_card(interaction_id=None, product_command=None, task_title=None,
                task_start=None, task_due=None, heading=None, *args):
     if args or interaction_id is None:
@@ -72,15 +76,15 @@ def build_card(interaction_id=None, product_command=None, task_title=None,
     tl=f"时间: {_fmt_slot(task_start,task_due)}" if task_start and task_due else ""
     if task_start and not task_due: tl=f"开始: {_fmt_point(task_start)}"
     if task_due and not task_start: tl=f"完成: {_fmt_point(task_due)}"
-    return _card(heading,f"**{task_title}**\n{tl}",[_btn(l,a,t,interaction_id) for l,a,t in acts])
+    return _card(heading,"\n".join(filter(None,(_task_block(task_title),_meta(tl)))),[_btn(l,a,t,interaction_id) for l,a,t in acts])
 
-def build_extend_card(iid,title): return _card("延长时间",f"**{title}**\n选择延长时间：",
+def build_extend_card(iid,title): return _card("延长时间",f"{_task_block(title)}\n选择延长时间：",
     [_btn(f"+{m} 分钟","extend_confirm","primary" if m==15 else "default",iid,minutes=m) for m in (15,30,60)])
 def build_reschedule_card(iid,title,slots,selected=None):
     btns=[_btn(_fmt_slot(s.get('start'),s.get('due')),"reschedule_pick","primary" if i==0 else "default",iid,slot_index=i) for i,s in enumerate(slots[:5])]
-    btns.append(_btn("自定义时间","reschedule_custom","default",iid,task_title=title))
+    btns.append(_btn("自定义时间","reschedule_custom","default",iid))
     prompt=(f"你选择的 **{_fmt_slot(*selected)}** 已被占用。\n请选择其他时间：" if selected else "选择新时间：")
-    return _card("时间冲突" if selected else "重新安排时间",f"**{title}**\n{prompt}",btns)
+    return _card("时间冲突" if selected else "重新安排时间",f"{_task_block(title)}\n{prompt}",btns)
 def build_custom_time_card(iid, title):
     """Card with JSON 1.0 form: date_picker + time pickers + submit button."""
     return {
@@ -91,7 +95,7 @@ def build_custom_time_card(iid, title):
                 "tag": "form",
                 "name": "custom_time_form",
                 "elements": [
-                    {"tag": "markdown", "content": f"**{title}**\n选择具体时间："},
+                    {"tag": "markdown", "content": f"{_task_block(title)}\n选择具体时间："},
                     {"tag": "date_picker", "name": "custom_date",
                      "required": True, "placeholder": {"tag": "plain_text", "content": "选择日期"}},
                     {"tag": "picker_time", "name": "custom_start_time",
@@ -114,10 +118,10 @@ def build_custom_time_card(iid, title):
         ],
     }
 def build_confirm_card(iid,title,proposal):
-    return _card("确认操作",f"**{title}**\n{_fmt_proposal(proposal)}\n确认？",[_btn("确认","confirm","primary",iid),_btn("取消","cancel","danger",iid)])
+    return _card("确认操作",f"{_task_block(title)}\n{_meta(_fmt_proposal(proposal))}\n确认？",[_btn("确认","confirm","primary",iid),_btn("取消","cancel","danger",iid)])
 def build_status_card(title,heading,message,proposal=None,template="green"):
-    when=_fmt_proposal(proposal); timing=f"\n时间: {when}" if when else ""
-    return {"config":{"wide_screen_mode":True,"update_multi":True},"header":{"title":{"content":heading,"tag":"plain_text"},"template":template},"elements":[{"tag":"markdown","content":f"**{title}**\n{message}{timing}"}]}
+    when=_fmt_proposal(proposal); timing=f"\n{_meta(f'时间: {when}')}" if when else ""
+    return {"config":{"wide_screen_mode":True,"update_multi":True},"header":{"title":{"content":heading,"tag":"plain_text"},"template":template},"elements":[{"tag":"markdown","content":f"{_task_block(title)}\n{message}{timing}"}]}
 def build_consumed_card(title): return build_status_card(title,"已处理","请继续使用最新卡片。",template="grey")
 def _card(h,b,acts): return {"config":{"wide_screen_mode":True,"update_multi":True},"header":{"title":{"content":h,"tag":"plain_text"},"template":"orange" if h=="确认操作" else "blue"},"elements":[{"tag":"markdown","content":b},{"tag":"action","actions":acts}]}
 def _btn(label,action,bt,iid,**x): v={"hermes_action":"pa_reminder","interaction_id":iid,"action":action}; v.update(x); return {"tag":"button","text":{"tag":"plain_text","content":label},"type":bt,"value":v}

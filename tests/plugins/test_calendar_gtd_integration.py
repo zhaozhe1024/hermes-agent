@@ -585,6 +585,28 @@ class TestShouldSendCard:
 
 
 class TestCardBuilding:
+    def test_linked_task_display_survives_followup_cards(self):
+        from reminder_card_handler import build_card, build_confirm_card
+        display = (
+            "**[Test Task](https://notion.so/task)**\n"
+            "<font color='grey'>*[Important · Work]*</font>"
+        )
+
+        initial = build_card(
+            "iid-link", "task.start", display,
+            "2026-01-01T10:00+08:00", "2026-01-01T11:00+08:00",
+            "即将开始",
+        )
+        followup = build_confirm_card(
+            "iid-link", display,
+            {"start": "2026-01-01T10:00+08:00", "due": "2026-01-01T11:00+08:00"},
+        )
+
+        for card in (initial, followup):
+            content = card["elements"][0]["content"]
+            assert "**[Test Task](https://notion.so/task)**" in content
+            assert "<font color='grey'>*[Important · Work]*</font>" in content
+
     def test_start_card_build(self):
         from reminder_card_handler import build_card
         card = build_card("iid-1", "task.start", "Test Task",
